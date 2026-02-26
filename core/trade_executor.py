@@ -167,6 +167,115 @@ class TradeExecutor:
             return False
 
     # ------------------------------------------------------------------ #
+    #  Triangular  (Panora APT/AMI + CEX hedge)
+    # ------------------------------------------------------------------ #
+    async def execute_triangular(
+        self,
+        direction: str,          # "APT_TO_AMI" | "AMI_TO_APT"
+        cex_name: str,           # "Bybit" | "MEXC"
+        apt_symbol: str,         # e.g. "APTUSDT"
+        ami_symbol: str,         # e.g. "AMIUSDT"
+        prefetched_quote: "Optional[dict]" = None,
+        # Dir APT_TO_AMI
+        qty_apt: float = 0.0,
+        cex_apt_ask: float = 0.0,
+        cex_ami_bid: float = 0.0,
+        # Dir AMI_TO_APT
+        qty_ami: float = 0.0,
+        cex_ami_ask: float = 0.0,
+        cex_apt_bid: float = 0.0,
+    ) -> bool:
+        """Execute triangular arb: Panora swap + CEX hedge (sequential).
+
+        Direction APT_TO_AMI:
+          Leg 1 — Panora: swap qty_apt APT → AMI  (from Aptos wallet)
+          Leg 2 — CEX:    sell equivalent AMI      (from pre-positioned CEX balance)
+          Profit source: Panora gives more AMI per APT than CEX implied rate.
+
+        Direction AMI_TO_APT:
+          Leg 1 — Panora: swap qty_ami AMI → APT  (from Aptos wallet)
+          Leg 2 — CEX:    sell equivalent APT      (from pre-positioned CEX balance)
+
+        Sequential execution: Panora first. If it fails, CEX leg is aborted
+        to avoid an unhedged position.
+        """
+        if not self.panora_executor:
+            logger.error("TradeExecutor: no PanoraExecutor — cannot execute triangular")
+            return False
+
+        if direction == "APT_TO_AMI":
+            safe_qty   = min(qty_apt, settings.trade_amount_usdt / max(cex_apt_ask, 1e-12))
+            ami_to_sell = safe_qty * (cex_apt_ask / max(cex_ami_bid, 1e-12))  # approx
+
+            logger.info(
+                f"{'[DRY]' if self.dry_run else '[LIVE]'} TRI-DIR1 | {cex_name} | "
+                f"Panora {safe_qty:.4f} APT\u2192AMI  then sell ~{ami_to_sell:.2f} AMI @ {cex_ami_bid:.8f}"
+            )
+            if self.dry_run:
+                return True
+
+            # Leg 1: Panora APT→AMI
+            tx = await self.panora_executor.execute_swap(
+                safe_qty,
+                from_token_address=settings.apt_token_address,
+                to_token_address=settings.ami_token_address,
+                prefetched_quote=prefetched_quote,
+            )
+            if not tx:
+                logger.error("❌ TRI-DIR1: Panora swap APT→AMI failed → aborting CEX leg")
+                return False
+            logger.info(f"✅ TRI-DIR1 Leg1 done | tx={tx}")
+
+            # Leg 2: CEX sell AMI
+            order_id = await self._cex_sell(cex_name, ami_symbol, ami_to_sell)
+            if not order_id:
+                logger.error(
+                    f"❌ TRI-DIR1: CEX sell AMI failed (Panora swap already done tx={tx}) "
+                    f"— manual rebalance required"
+                )
+                return False
+            logger.success(f"✅ TRI-DIR1 complete | panora_tx={tx} cex_order={order_id}")
+            return True
+
+        elif direction == "AMI_TO_APT":
+            safe_qty   = min(qty_ami, settings.trade_amount_usdt / max(cex_ami_ask, 1e-12))
+            apt_to_sell = safe_qty * (cex_ami_ask / max(cex_apt_bid, 1e-12))  # approx
+
+            logger.info(
+                f"{'[DRY]' if self.dry_run else '[LIVE]'} TRI-DIR2 | {cex_name} | "
+                f"Panora {safe_qty:.2f} AMI\u2192APT  then sell ~{apt_to_sell:.4f} APT @ {cex_apt_bid:.4f}"
+            )
+            if self.dry_run:
+                return True
+
+            # Leg 1: Panora AMI→APT
+            tx = await self.panora_executor.execute_swap(
+                safe_qty,
+                from_token_address=settings.ami_token_address,
+                to_token_address=settings.apt_token_address,
+                prefetched_quote=prefetched_quote,
+            )
+            if not tx:
+                logger.error("❌ TRI-DIR2: Panora swap AMI→APT failed → aborting CEX leg")
+                return False
+            logger.info(f"✅ TRI-DIR2 Leg1 done | tx={tx}")
+
+            # Leg 2: CEX sell APT
+            order_id = await self._cex_sell(cex_name, apt_symbol, apt_to_sell)
+            if not order_id:
+                logger.error(
+                    f"❌ TRI-DIR2: CEX sell APT failed (Panora swap already done tx={tx}) "
+                    f"— manual rebalance required"
+                )
+                return False
+            logger.success(f"✅ TRI-DIR2 complete | panora_tx={tx} cex_order={order_id}")
+            return True
+
+        else:
+            logger.error(f"TradeExecutor: unknown triangular direction={direction}")
+            return False
+
+    # ------------------------------------------------------------------ #
     #  Internal helpers
     # ------------------------------------------------------------------ #
     async def _cex_buy(

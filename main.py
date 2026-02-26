@@ -106,23 +106,39 @@ async def main() -> None:
 
     collector = PriceCollector()
 
-    # --- Exchange connectors ---
-    bybit = BybitWS(collector)
-    mexc = MexcWS(collector)
-    panora = PanoraPoller(
+    # --- Exchange connectors (subscribe to both AMI/USDT and APT/USDT) ---
+    cex_symbols = [settings.cex_symbol, settings.apt_cex_symbol]
+    bybit = BybitWS(collector, symbols=cex_symbols)
+    mexc  = MexcWS(collector,  symbols=cex_symbols)
+
+    # --- Panora pollers: AMI→USDT, APT→AMI, AMI→APT ---
+    panora_ami_usdt = PanoraPoller(
         collector,
         from_amount=1.0,
         from_token_address=settings.ami_token_address,
         to_token_address=settings.usdt_token_address,
     )
+    panora_apt_ami = PanoraPoller(
+        collector,
+        from_amount=1.0,
+        from_token_address=settings.apt_token_address,
+        to_token_address=settings.ami_token_address,
+    )
+    panora_ami_apt = PanoraPoller(
+        collector,
+        from_amount=1.0,
+        from_token_address=settings.ami_token_address,
+        to_token_address=settings.apt_token_address,
+    )
 
     # --- Trade execution ---
-    panora_executor = PanoraExecutor(panora.client)
-    trade_executor = TradeExecutor(panora_executor=panora_executor)
+    panora_executor = PanoraExecutor(panora_ami_usdt.client)
+    trade_executor  = TradeExecutor(panora_executor=panora_executor)
 
     arb = ArbitrageEngine(
         collector,
-        panora_client=panora.client,
+        panora_client=panora_ami_usdt.client,
+        panora_apt_client=panora_apt_ami.client,   # used for APT↔AMI triangular verify
         trade_executor=trade_executor,
         enable_panora_arb=enable_panora,
         enable_bybit_arb=enable_bybit,
@@ -142,14 +158,16 @@ async def main() -> None:
 
     # --- Launch all tasks ---
     tasks = [
-        asyncio.create_task(bybit.connect(), name="bybit"),
-        asyncio.create_task(mexc.connect(), name="mexc"),
-        asyncio.create_task(panora.poll(), name="panora"),
-        asyncio.create_task(arb.run(), name="arb_engine"),
+        asyncio.create_task(bybit.connect(),          name="bybit"),
+        asyncio.create_task(mexc.connect(),           name="mexc"),
+        asyncio.create_task(panora_ami_usdt.poll(),   name="panora_ami_usdt"),
+        asyncio.create_task(panora_apt_ami.poll(),    name="panora_apt_ami"),
+        asyncio.create_task(panora_ami_apt.poll(),    name="panora_ami_apt"),
+        asyncio.create_task(arb.run(),                name="arb_engine"),
     ]
 
     logger.info(
-        f"Arb bot started | symbol={settings.cex_symbol} "
+        f"Arb bot started | symbols={cex_symbols} "
         f"bybit_fee={settings.bybit_fee*100:.2f}% mexc_fee={settings.mexc_fee*100:.2f}% "
         f"panora_fee={settings.panora_fee*100:.2f}%"
     )
@@ -161,9 +179,11 @@ async def main() -> None:
     for t in tasks:
         t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
-    
+
     # Close Panora sessions
-    await panora.close()
+    await panora_ami_usdt.close()
+    await panora_apt_ami.close()
+    await panora_ami_apt.close()
     await panora_executor.close()
 
     logger.info("Arb bot shut down cleanly.")

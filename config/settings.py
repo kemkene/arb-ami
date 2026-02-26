@@ -29,10 +29,20 @@ class Settings:
             "0x357b0b74bc833e95a115ad22604854d6b0fca151cecd94111770e5d6ffc9dc2b",
         )
     )
+    # Native APT coin address on Aptos
+    apt_token_address: str = field(
+        default_factory=lambda: os.getenv(
+            "APT_TOKEN_ADDRESS",
+            "0x1::aptos_coin::AptosCoin",
+        )
+    )
 
     # CEX settings
     cex_symbol: str = field(
         default_factory=lambda: os.getenv("CEX_SYMBOL", "AMIUSDT")
+    )
+    apt_cex_symbol: str = field(
+        default_factory=lambda: os.getenv("APT_CEX_SYMBOL", "APTUSDT")
     )
     bybit_ws_url: str = "wss://stream.bybit.com/v5/public/spot"
     mexc_rest_url: str = "https://api.mexc.com/api/v3/ticker/bookTicker"
