@@ -5,7 +5,7 @@ import hashlib
 import hmac
 import json
 import time
-from typing import Optional
+from typing import Dict, Optional
 
 import aiohttp
 
@@ -35,6 +35,75 @@ class BybitTrader:
             message.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
+
+    def _auth_headers(self, timestamp: str, recv_window: str, body: str) -> dict:
+        return {
+            "X-BAPI-API-KEY":     self.api_key,
+            "X-BAPI-SIGN":        self._sign(timestamp, recv_window, body),
+            "X-BAPI-SIGN-TYPE":   "2",
+            "X-BAPI-TIMESTAMP":   timestamp,
+            "X-BAPI-RECV-WINDOW": recv_window,
+            "Content-Type":       "application/json",
+        }
+
+    async def get_balance(self, coins: list[str] | None = None) -> Dict[str, float]:
+        """Return spot wallet balances as {coin: free_qty}.
+
+        If coins is provided, only those coins are returned.
+        Returns {} on error.
+        """
+        if not self._is_configured():
+            logger.error("BybitTrader.get_balance: API key/secret not configured")
+            return {}
+
+        timestamp    = str(int(time.time() * 1000))
+        recv_window  = "5000"
+        # GET request — body is empty string for signature
+        qs = "accountType=UNIFIED"
+        sign_body = timestamp + self.api_key + recv_window + qs
+        signature = hmac.new(
+            self.api_secret.encode("utf-8"),
+            sign_body.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        headers = {
+            "X-BAPI-API-KEY":     self.api_key,
+            "X-BAPI-SIGN":        signature,
+            "X-BAPI-SIGN-TYPE":   "2",
+            "X-BAPI-TIMESTAMP":   timestamp,
+            "X-BAPI-RECV-WINDOW": recv_window,
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{BASE_URL}/v5/account/wallet-balance",
+                    params={"accountType": "UNIFIED"},
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    data = await resp.json()
+
+            if data.get("retCode") != 0:
+                logger.error(
+                    f"BybitTrader.get_balance error: retCode={data.get('retCode')} "
+                    f"retMsg={data.get('retMsg')}"
+                )
+                return {}
+
+            result: Dict[str, float] = {}
+            for account in data.get("result", {}).get("list", []):
+                for coin_data in account.get("coin", []):
+                    coin = coin_data.get("coin", "")
+                    free = float(coin_data.get("availableToWithdraw") or coin_data.get("free") or 0)
+                    result[coin] = free
+
+            if coins:
+                result = {c: result.get(c, 0.0) for c in coins}
+            return result
+
+        except Exception as e:
+            logger.error(f"BybitTrader.get_balance exception: {e}")
+            return {}
 
     async def place_market_order(
         self,

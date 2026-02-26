@@ -191,6 +191,82 @@ class PanoraExecutor:
             logger.warning(f"PanoraExecutor: could not check APT balance: {e}")
         return None
 
+    async def get_token_balance(
+        self,
+        wallet: str,
+        token_address: str,
+        decimals: int = 8,
+    ) -> Optional[float]:
+        """Return human-readable token balance for any Aptos coin/FA.
+
+        For APT (0x1::aptos_coin::AptosCoin):
+            Uses ``0x1::coin::balance`` view function.
+        For other tokens (FA or legacy Coin):
+            Tries ``0x1::primary_fungible_store::balance`` first (FA standard),
+            then falls back to ``0x1::coin::balance<token_address>``.
+
+        Returns float balance (divided by 10^decimals), or None on error.
+        """
+        try:
+            async with aiohttp.ClientSession() as s:
+                if token_address in (
+                    "0x1::aptos_coin::AptosCoin",
+                    "0x000000000000000000000000000000000000000000000000000000000000000a",
+                    "0xa",
+                ):
+                    # Native APT via coin::balance
+                    async with s.post(
+                        f"{settings.aptos_node_url}/view",
+                        json={
+                            "function":       "0x1::coin::balance",
+                            "type_arguments": ["0x1::aptos_coin::AptosCoin"],
+                            "arguments":      [wallet],
+                        },
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            return int(data[0]) / (10 ** self.APT_DECIMALS)
+                        body = await resp.text()
+                        logger.warning(
+                            f"PanoraExecutor.get_token_balance APT {resp.status}: {body[:120]}"
+                        )
+                        return None
+
+                # --- Non-APT: try FA primary_fungible_store::balance first ---
+                fa_addr = token_address.split("::")[0]  # strip module/struct portions
+                async with s.post(
+                    f"{settings.aptos_node_url}/view",
+                    json={
+                        "function":       "0x1::primary_fungible_store::balance",
+                        "type_arguments": ["0x1::fungible_asset::Metadata"],
+                        "arguments":      [wallet, fa_addr],
+                    },
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return int(data[0]) / (10 ** decimals)
+
+                # --- Fallback: legacy coin::balance<T> ---
+                async with s.post(
+                    f"{settings.aptos_node_url}/view",
+                    json={
+                        "function":       "0x1::coin::balance",
+                        "type_arguments": [token_address],
+                        "arguments":      [wallet],
+                    },
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return int(data[0]) / (10 ** decimals)
+                    body = await resp.text()
+                    logger.warning(
+                        f"PanoraExecutor.get_token_balance {token_address} {resp.status}: {body[:120]}"
+                    )
+
+        except Exception as e:
+            logger.warning(f"PanoraExecutor.get_token_balance exception: {e}")
+        return None
+
     def _compute_max_gas(self, apt_octas: Optional[int]) -> int:
         """Compute a safe max_gas_amount given available APT balance."""
         if apt_octas is None:

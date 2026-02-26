@@ -5,7 +5,7 @@ import hashlib
 import hmac
 import time
 import urllib.parse
-from typing import Optional
+from typing import Dict, Optional
 
 import aiohttp
 
@@ -33,6 +33,53 @@ class MexcTrader:
             query_string.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
+
+    async def get_balance(self, coins: list[str] | None = None) -> Dict[str, float]:
+        """Return spot account balances as {coin: free_qty}.
+
+        If coins is provided, only those coins are returned.
+        Returns {} on error.
+        """
+        if not self._is_configured():
+            logger.error("MexcTrader.get_balance: API key/secret not configured")
+            return {}
+
+        timestamp    = str(int(time.time() * 1000))
+        params       = {"timestamp": timestamp}
+        query_string = urllib.parse.urlencode(params)
+        params["signature"] = self._sign(query_string)
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{BASE_URL}/api/v3/account",
+                    params=params,
+                    headers={"X-MEXC-APIKEY": self.api_key},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    data = await resp.json()
+
+            if "code" in data and data["code"] != 200:
+                logger.error(
+                    f"MexcTrader.get_balance error: code={data.get('code')} "
+                    f"msg={data.get('msg')}"
+                )
+                return {}
+
+            result: Dict[str, float] = {}
+            for bal in data.get("balances", []):
+                asset = bal.get("asset", "")
+                free  = float(bal.get("free", 0))
+                if free > 0 or (coins and asset in coins):
+                    result[asset] = free
+
+            if coins:
+                result = {c: result.get(c, 0.0) for c in coins}
+            return result
+
+        except Exception as e:
+            logger.error(f"MexcTrader.get_balance exception: {e}")
+            return {}
 
     async def place_market_order(
         self,
