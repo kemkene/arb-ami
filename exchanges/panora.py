@@ -8,9 +8,58 @@ from utils.logger import get_logger
 
 logger = get_logger()
 
-# How long (seconds) a cached quote is considered fresh.
-# Set equal to poll interval so the cache expires just as a new poll arrives.
+# How long (seconds) an exact-amount cached quote is considered fresh.
+# Equal to poll interval — expires just as the next poll arrives.
 _QUOTE_CACHE_TTL: float = settings.panora_poll_interval
+
+# How long (seconds) the unit-price cache (price/unit) stays valid.
+# Intentionally longer than poll interval so that a successful verify call
+# (or any HTTP call) keeps the price usable across multiple poller ticks
+# without firing extra HTTP calls.  Covers at least one full verify cooldown
+# cycle (3s) plus a poller tick buffer.
+_UNIT_PRICE_CACHE_TTL: float = max(settings.panora_poll_interval * 4, 6.0)
+
+# How long (seconds) a real quote with txData stays valid for execution.
+_EXEC_QUOTE_CACHE_TTL: float = max(settings.panora_poll_interval * 2, 2.0)
+
+# ---------------------------------------------------------------------------
+# Global rate limiter shared by ALL PanoraClient instances.
+#
+# Panora's public API allows roughly 3-5 req/s but concurrent bursts from
+# multiple pollers + arb-verify calls routinely exceed this.  A module-level
+# semaphore (capacity=1) serialises every HTTP call; the _MIN_INTERVAL guard
+# adds a minimum gap between consecutive calls to stay well under the limit.
+# ---------------------------------------------------------------------------
+_PANORA_SEM: Optional[asyncio.Semaphore] = None   # lazy-init (needs event loop)
+_PANORA_LAST_CALL: float = 0.0                     # Unix timestamp of last call
+
+def _get_min_interval() -> float:
+    """Get minimum interval from settings (allows runtime config via .env)."""
+    return settings.panora_api_min_interval
+
+
+def _get_semaphore() -> asyncio.Semaphore:
+    """Lazy-initialise the global semaphore once an event loop is running."""
+    global _PANORA_SEM
+    if _PANORA_SEM is None:
+        _PANORA_SEM = asyncio.Semaphore(1)
+    return _PANORA_SEM
+
+
+async def _acquire_slot() -> None:
+    """Wait for the global semaphore AND enforce the minimum inter-call interval."""
+    global _PANORA_LAST_CALL
+    sem = _get_semaphore()
+    await sem.acquire()
+    min_interval = _get_min_interval()
+    wait = min_interval - (time.time() - _PANORA_LAST_CALL)
+    if wait > 0:
+        await asyncio.sleep(wait)
+    _PANORA_LAST_CALL = time.time()
+
+
+def _release_slot() -> None:
+    _get_semaphore().release()
 
 
 class PanoraClient:
@@ -51,6 +100,11 @@ class PanoraClient:
         # fetches a real quote only at execution time.
         self._unit_price_cache: Dict[Tuple[str, str], Tuple[float, float]] = {}
 
+        # ── Execution quote cache (txData present) ─────────────────────
+        # key: (from_token_address, to_token_address, rounded_amount)
+        # value: (quote_dict, fetched_at_timestamp)
+        self._exec_quote_cache: Dict[tuple, Tuple[Dict[str, Any], float]] = {}
+
         # Rate limiting tracking
         self.max_retries = max_retries
         self.base_retry_delay = base_retry_delay
@@ -81,8 +135,10 @@ class PanoraClient:
     def _get_unit_price(self, from_addr: str, to_addr: str) -> Optional[float]:
         """Return cached price-per-unit if still fresh, else None."""
         entry = self._unit_price_cache.get((from_addr, to_addr))
-        if entry and (time.time() - entry[1]) < _QUOTE_CACHE_TTL:
-            return entry[0]
+        if entry:
+            age = time.time() - entry[1]
+            if age < _UNIT_PRICE_CACHE_TTL:
+                return entry[0]
         return None
 
     def _store_unit_price(
@@ -97,6 +153,19 @@ class PanoraClient:
     def is_synthetic(quote: Dict[str, Any]) -> bool:
         """Return True if *quote* was built from the unit-price cache (no txData)."""
         return bool(quote.get("_synthetic"))
+
+    @staticmethod
+    def has_tx_data(quote: Dict[str, Any]) -> bool:
+        """Return True if quote contains txData for on-chain execution."""
+        quotes = quote.get("quotes")
+        if isinstance(quotes, list) and quotes:
+            tx_data = quotes[0].get("txData")
+            if isinstance(tx_data, dict) and "function" in tx_data:
+                return True
+        for candidate in [quote.get("txData"), quote.get("payload"), quote]:
+            if isinstance(candidate, dict) and "function" in candidate:
+                return True
+        return False
 
     def _get_cached_quote(self, from_addr: str, to_addr: str, amount: float
                           ) -> Optional[Dict[str, Any]]:
@@ -116,12 +185,69 @@ class PanoraClient:
             k: v for k, v in self._quote_cache.items() if v[1] > cutoff
         }
 
+    def _store_exec_quote(self, from_addr: str, to_addr: str, amount: float,
+                          quote: Dict[str, Any]) -> None:
+        key = self._cache_key(from_addr, to_addr, amount)
+        self._exec_quote_cache[key] = (quote, time.time())
+        cutoff = time.time() - _EXEC_QUOTE_CACHE_TTL * 2
+        self._exec_quote_cache = {
+            k: v for k, v in self._exec_quote_cache.items() if v[1] > cutoff
+        }
+
+    def get_cached_execution_quote(
+        self,
+        from_addr: str,
+        to_addr: str,
+        amount: float,
+        max_age_s: float | None = None,
+    ) -> Optional[Dict[str, Any]]:
+        key = self._cache_key(from_addr, to_addr, amount)
+        entry = self._exec_quote_cache.get(key)
+        if not entry:
+            return None
+        age = time.time() - entry[1]
+        ttl = _EXEC_QUOTE_CACHE_TTL if max_age_s is None else max_age_s
+        if age > ttl:
+            return None
+        quote = entry[0]
+        return quote if self.has_tx_data(quote) else None
+
+    def check_quote_price_deviation(
+        self,
+        quote: Dict[str, Any],
+        from_addr: str,
+        to_addr: str,
+        from_amount: float,
+        threshold_pct: float,
+    ) -> Tuple[bool, float]:
+        """Check if cached quote's price deviates from current unit-price cache.
+
+        Returns (is_within_threshold, deviation_pct).
+        If unit-price cache is stale or missing, returns (True, 0.0) - allow cached quote.
+        """
+        # Get current unit price from cache
+        current_unit_price = self._get_unit_price(from_addr, to_addr)
+        if current_unit_price is None:
+            # No recent unit price - can't check deviation, allow cached quote
+            return (True, 0.0)
+
+        # Parse quote's toTokenAmount
+        to_amount = self.parse_to_token_amount(quote)
+        if to_amount is None or to_amount <= 0:
+            return (False, 999.9)  # Invalid quote
+
+        cached_price = to_amount / from_amount
+        deviation_pct = abs(cached_price - current_unit_price) / current_unit_price * 100
+
+        return (deviation_pct <= threshold_pct, deviation_pct)
+
     async def get_swap_quote(
         self,
         from_token_amount: float,
         from_token_address: str | None = None,
         to_token_address: str | None = None,
         force_fresh: bool = False,
+        slippage_pct: float | None = None,
     ) -> Optional[Dict[str, Any]]:
         """Get a swap quote from Panora API with retry logic for rate limits.
 
@@ -162,10 +288,14 @@ class PanoraClient:
                     "_unit_price": unit_price,
                 }
                 self._cache_hits += 1
+                entry = self._unit_price_cache.get((_from, _to))
+                age = round(time.time() - entry[1], 2) if entry else 0
+                remaining = round(_UNIT_PRICE_CACHE_TTL - age, 2)
                 logger.debug(
                     f"Panora unit-price cache hit | "
                     f"unit_price={unit_price:.8f} × {from_token_amount} "
-                    f"= {synthetic_amount:.6f} (hits={self._cache_hits})"
+                    f"= {synthetic_amount:.6f} | age={age}s ttl_remaining={remaining}s "
+                    f"(hits={self._cache_hits})"
                 )
                 return synthetic_quote
 
@@ -177,8 +307,11 @@ class PanoraClient:
         }
         if self.to_wallet_address:
             params["toWalletAddress"] = self.to_wallet_address
+        if slippage_pct is not None:
+            params["slippage"] = slippage_pct
 
         for attempt in range(self.max_retries):
+            await _acquire_slot()
             try:
                 session = await self._get_session()
                 async with session.post(self.api_url, params=params) as resp:
@@ -189,9 +322,10 @@ class PanoraClient:
                             )
                         self.rate_limited = False
                         quote = await resp.json()
+                        _release_slot()
                         self._store_cached_quote(_from, _to, from_token_amount, quote)
-                        # Persist unit price so subsequent verify calls with
-                        # different amounts can use the synthetic-quote path.
+                        if self.has_tx_data(quote):
+                            self._store_exec_quote(_from, _to, from_token_amount, quote)
                         to_amount = self.parse_to_token_amount(quote)
                         if to_amount is not None:
                             self._store_unit_price(
@@ -200,6 +334,7 @@ class PanoraClient:
                         return quote
                     
                     elif resp.status in (429, 503):
+                        _release_slot()
                         self._total_rate_limits += 1
                         self._rate_limit_count += 1
                         self._last_rate_limit_time = time.time()
@@ -237,9 +372,11 @@ class PanoraClient:
                     else:
                         body = await resp.text()
                         logger.error(f"Panora API HTTP {resp.status}: {body[:200]}")
+                        _release_slot()
                         return None
                         
             except asyncio.TimeoutError:
+                _release_slot()
                 logger.error(
                     f"Panora API timeout - attempt {attempt + 1}/{self.max_retries}"
                 )
@@ -250,10 +387,12 @@ class PanoraClient:
                 return None
                     
             except aiohttp.ClientError as e:
+                _release_slot()
                 logger.error(f"Panora API network error: {e}")
                 return None
                 
             except Exception as e:
+                _release_slot()
                 logger.error(f"Panora API unexpected error: {e}")
                 return None
 

@@ -1,5 +1,6 @@
 import asyncio
 import aiohttp
+import time
 from typing import List
 
 from config.settings import settings
@@ -7,6 +8,8 @@ from core.price_collector import PriceCollector
 from utils.logger import get_logger
 
 logger = get_logger()
+
+_LOG_INTERVAL_S = 15.0  # log MEXC prices at INFO every ~15 seconds
 
 MEXC_REST = settings.mexc_rest_url
 
@@ -26,6 +29,7 @@ class MexcWS:
             self.symbols = [symbols]
         else:
             self.symbols = list(symbols)
+        self._last_log: dict = {}  # {symbol: last_log_timestamp}
 
     async def _poll_symbol(self, session: aiohttp.ClientSession, symbol: str) -> None:
         """Fetch bookTicker for a single symbol and update collector."""
@@ -43,6 +47,13 @@ class MexcWS:
                     "mexc", symbol, bid, ask,
                     bid_qty=bid_qty, ask_qty=ask_qty,
                 )
+                now = time.time()
+                if now - self._last_log.get(symbol, 0) >= _LOG_INTERVAL_S:
+                    self._last_log[symbol] = now
+                    logger.info(
+                        f"[MEXC] {symbol} bid={bid} ask={ask} "
+                        f"bid_qty={bid_qty} ask_qty={ask_qty}"
+                    )
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.warning(f"MEXC REST network error [{symbol}]: {e}")
         except (KeyError, ValueError) as e:

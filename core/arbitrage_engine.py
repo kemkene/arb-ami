@@ -1,4 +1,5 @@
 import asyncio
+import time
 from typing import Optional, Tuple, TYPE_CHECKING
 
 from config.settings import settings
@@ -21,6 +22,7 @@ class ArbitrageEngine:
         cex_symbol: str | None = None,
         panora_client: "Optional[PanoraClient]" = None,
         panora_apt_client: "Optional[PanoraClient]" = None,
+        panora_ami_apt_client: "Optional[PanoraClient]" = None,
         trade_executor: "Optional[TradeExecutor]" = None,
         enable_panora_arb: bool = True,
         enable_bybit_arb: bool = True,
@@ -29,8 +31,9 @@ class ArbitrageEngine:
         self.collector = collector
         self.cex_symbol = cex_symbol or settings.cex_symbol
         self.apt_cex_symbol = settings.apt_cex_symbol
-        self.panora_client     = panora_client       # AMI/USDT client
-        self.panora_apt_client = panora_apt_client   # APT/AMI and AMI/APT client
+        self.panora_client       = panora_client        # AMI→USDT client
+        self.panora_apt_client   = panora_apt_client    # APT→AMI client
+        self.panora_ami_apt_client = panora_ami_apt_client  # AMI→APT client
         self.trade_executor = trade_executor
         self.bybit_fee = settings.bybit_fee
         self.mexc_fee = settings.mexc_fee
@@ -40,9 +43,9 @@ class ArbitrageEngine:
         self.enable_panora_arb = enable_panora_arb
         self.enable_bybit_arb  = enable_bybit_arb
         self.enable_mexc_arb   = enable_mexc_arb
+        self.skip_panora_verify = settings.skip_panora_verify
 
         # Collector symbol keys for Panora pollers
-        # PanoraPoller uses f"{from[:4]}_{to[:4]}" as symbol
         self._sym_ami_usdt = (
             f"{settings.ami_token_address[:4]}_{settings.usdt_token_address[:4]}"
         )
@@ -52,6 +55,19 @@ class ArbitrageEngine:
         self._sym_ami_apt = (
             f"{settings.ami_token_address[:4]}_{settings.apt_token_address[:4]}"
         )
+
+        # Per-direction verify cooldown: don't hammer Panora verify calls when arb
+        # persists across consecutive 0.1s engine ticks.  Key = direction string.
+        self._VERIFY_COOLDOWN_S = 3.0  # minimum seconds between verify calls per direction
+        self._last_verify: dict = {}
+
+        # Slippage tolerance (as decimal, e.g., 0.001 = 0.1%)
+        self.slippage_tolerance_pct = settings.slippage_tolerance_pct / 100.0
+        self.panora_api_slippage_pct = settings.panora_api_slippage_pct / 100.0
+
+        # Price summary log interval
+        self._PRICE_LOG_INTERVAL_S = 5.0
+        self._last_price_log: float = 0.0
 
     # ------------------------------------------------------------------ #
     #  Helpers
@@ -200,11 +216,36 @@ class ArbitrageEngine:
                 panora.ask, cex.bid, qty, self.panora_fee, cex_fee
             )
             if profit > self.min_profit:
+                if self.skip_panora_verify:
+                    logger.warning(
+                        f"⚠️ SKIP VERIFY | BUY Panora → SELL {cex_name} | "
+                        f"est_price={panora.ask:.8f} qty={qty:.6f} est_profit={profit:.4f}"
+                    )
+                    prefetched = await self.panora_client.get_swap_quote(
+                        qty * panora.ask,
+                        from_token_address=settings.usdt_token_address,
+                        to_token_address=settings.ami_token_address,
+                        slippage_pct=settings.panora_api_slippage_pct,
+                    )
+                    if self.trade_executor:
+                        asyncio.create_task(
+                            self.trade_executor.execute_dex_cex(
+                                "BUY_DEX_SELL_CEX", cex_name,
+                                self.cex_symbol, panora.ask, cex.bid, qty,
+                                prefetched_quote=prefetched,
+                            ),
+                            name="exec_dex_cex_skip_verify",
+                        )
+                    return
+                _vkey = f"DEX_BUY_{cex_name}"
+                if time.time() - self._last_verify.get(_vkey, 0) < self._VERIFY_COOLDOWN_S:
+                    return
                 # Verify buy from Panora: USDC → AMI
                 logger.info(
                     f"🔍 Verifying Panora price | BUY Panora → SELL {cex_name} | "
                     f"est_price={panora.ask:.8f} qty={qty:.6f} est_profit={profit:.4f}"
                 )
+                self._last_verify[_vkey] = time.time()
                 verified = await self._verify_panora_buy(qty, panora.ask)
                 if verified:
                     v_price, v_qty, v_quote = verified  # reuse quote — no second API call
@@ -249,11 +290,36 @@ class ArbitrageEngine:
                 cex.ask, panora.bid, qty, cex_fee, self.panora_fee
             )
             if profit > self.min_profit:
+                if self.skip_panora_verify:
+                    logger.warning(
+                        f"⚠️ SKIP VERIFY | BUY {cex_name} → SELL Panora | "
+                        f"est_price={panora.bid:.8f} qty={qty:.6f} est_profit={profit:.4f}"
+                    )
+                    prefetched = await self.panora_client.get_swap_quote(
+                        qty,
+                        from_token_address=settings.ami_token_address,
+                        to_token_address=settings.usdt_token_address,
+                        slippage_pct=settings.panora_api_slippage_pct,
+                    )
+                    if self.trade_executor:
+                        asyncio.create_task(
+                            self.trade_executor.execute_dex_cex(
+                                "BUY_CEX_SELL_DEX", cex_name,
+                                self.cex_symbol, cex.ask, panora.bid, qty,
+                                prefetched_quote=prefetched,
+                            ),
+                            name="exec_dex_cex_skip_verify",
+                        )
+                    return
+                _vkey = f"DEX_SELL_{cex_name}"
+                if time.time() - self._last_verify.get(_vkey, 0) < self._VERIFY_COOLDOWN_S:
+                    return
                 # Verify sell on Panora: AMI → USDC
                 logger.info(
                     f"🔍 Verifying Panora price | BUY {cex_name} → SELL Panora | "
                     f"est_price={panora.bid:.8f} qty={qty:.6f} est_profit={profit:.4f}"
                 )
+                self._last_verify[_vkey] = time.time()
                 result = await self._verify_panora_sell(qty)
                 if result is not None:
                     v_price, v_quote = result  # reuse quote — no second API call
@@ -321,17 +387,20 @@ class ArbitrageEngine:
         """Send qty_ami AMI → receive ? APT on Panora.
 
         Returns (apt_per_ami, raw_quote) or None.
+        Uses panora_ami_apt_client (AMI→APT direction) so the unit-price
+        cache from the AMI→APT poller is hit correctly.
         """
-        if not self.panora_apt_client:
+        client = self.panora_ami_apt_client or self.panora_apt_client
+        if not client:
             return None
-        quote = await self.panora_apt_client.get_swap_quote(
+        quote = await client.get_swap_quote(
             qty_ami,
             from_token_address=settings.ami_token_address,
             to_token_address=settings.apt_token_address,
         )
         if not quote:
             return None
-        apt_out = self.panora_apt_client.parse_to_token_amount(quote)
+        apt_out = client.parse_to_token_amount(quote)
         if apt_out is None or apt_out <= 0:
             return None
         return apt_out / qty_ami, quote
@@ -342,27 +411,14 @@ class ArbitrageEngine:
         cex_apt: PriceData,
         cex_name: str,
     ) -> None:
-        """Detect and verify triangular arb between Panora APT/AMI and CEX.
-
-        Direction 1 — APT → AMI via Panora, sell AMI on CEX:
-          Start with USDT → buy APT on CEX → swap APT→AMI on Panora
-          → sell AMI on CEX.  Profitable when Panora's APT/AMI rate is
-          higher than the CEX-implied rate (apt_bid / ami_ask).
-
-        Direction 2 — AMI → APT via Panora, sell APT on CEX:
-          Start with USDT → buy AMI on CEX → swap AMI→APT on Panora
-          → sell APT on CEX.  Profitable when Panora's AMI/APT rate is
-          higher than the CEX-implied rate (ami_bid / apt_ask).
-
-        Uses settings.trade_amount_usdt as the notional trade size.
-        """
+        """Detect and verify triangular arb between Panora APT/AMI and CEX."""
         if cex_ami.is_stale() or cex_apt.is_stale():
             return
         if not self.panora_apt_client:
             return
 
-        cex_fee = self.bybit_fee if cex_name == "Bybit" else self.mexc_fee
-        notional = settings.trade_amount_usdt  # USDT to deploy per direction
+        cex_fee  = self.bybit_fee if cex_name == "Bybit" else self.mexc_fee
+        notional = settings.trade_amount_usdt
 
         # ── Direction 1: buy APT on CEX → APT→AMI on Panora → sell AMI on CEX ──
         pan_apt_ami_prices = self.collector.get(self._sym_apt_ami)
@@ -385,17 +441,61 @@ class ArbitrageEngine:
             spread_pct   = (pan_apt_ami.ask - cex_implied) / cex_implied * 100
 
             if profit_est > self.min_profit:
+                if self.skip_panora_verify:
+                    logger.warning(
+                        f"⚠️ [TRI-DIR1] SKIP VERIFY | {cex_name} | "
+                        f"est_profit={profit_est:.4f} USDT"
+                    )
+                    prefetched = await self.panora_apt_client.get_swap_quote(
+                        qty_apt_est,
+                        from_token_address=settings.apt_token_address,
+                        to_token_address=settings.ami_token_address,
+                        slippage_pct=settings.panora_api_slippage_pct,
+                    )
+                    if self.trade_executor:
+                        asyncio.create_task(
+                            self.trade_executor.execute_triangular(
+                                direction="APT_TO_AMI",
+                                cex_name=cex_name,
+                                apt_symbol=self.apt_cex_symbol,
+                                ami_symbol=self.cex_symbol,
+                                qty_apt=qty_apt_est,
+                                cex_apt_ask=cex_apt.ask,
+                                cex_ami_bid=cex_ami.bid,
+                                prefetched_quote=prefetched,
+                            ),
+                            name="exec_tri_dir1_skip_verify",
+                        )
+                    return
                 logger.info(
                     f"🔍 [TRI-DIR1] {cex_name} | "
                     f"Panora APT→AMI={pan_apt_ami.ask:.4f}  "
                     f"CEX-implied={cex_implied:.4f}  "
                     f"spread={spread_pct:+.3f}%  est_profit={profit_est:.4f} USDT"
                 )
+                # Cooldown: skip verify if we already verified this direction recently
+                _vkey = f"TRI_DIR1_{cex_name}"
+                if time.time() - self._last_verify.get(_vkey, 0) < self._VERIFY_COOLDOWN_S:
+                    return
+                self._last_verify[_vkey] = time.time()
                 result = await self._verify_panora_apt_to_ami(qty_apt_est)
                 if result:
                     v_rate, v_quote = result
                     slippage = (v_rate - pan_apt_ami.ask) / pan_apt_ami.ask * 100
-                    v_ami_out  = qty_apt_est * v_rate
+                    
+                    # Allow slippage tolerance: if actual rate is worse than expected by
+                    # more than tolerance, use expected rate for profit calc (pessimistic)
+                    # Otherwise assume we got within tolerance and use actual rate
+                    adjusted_rate = v_rate
+                    if slippage < -self.slippage_tolerance_pct * 100:
+                        # Worse than tolerance, but still try with adjusted estimate
+                        adjusted_rate = pan_apt_ami.ask * (1 - self.slippage_tolerance_pct)
+                        logger.warning(
+                            f"⚠️ [TRI-DIR1] Slippage {slippage:.3f}% exceeds tolerance "
+                            f"{-self.slippage_tolerance_pct*100:.3f}% — using conservative rate"
+                        )
+                    
+                    v_ami_out  = qty_apt_est * adjusted_rate
                     v_usdt_out = v_ami_out * cex_ami.bid
                     v_fees = (
                         notional     * cex_fee
@@ -458,17 +558,59 @@ class ArbitrageEngine:
             spread_pct_rev  = (pan_ami_apt.ask - cex_implied_rev) / cex_implied_rev * 100
 
             if profit_est > self.min_profit:
+                if self.skip_panora_verify:
+                    logger.warning(
+                        f"⚠️ [TRI-DIR2] SKIP VERIFY | {cex_name} | "
+                        f"est_profit={profit_est:.4f} USDT"
+                    )
+                    client = self.panora_ami_apt_client or self.panora_apt_client
+                    prefetched = await client.get_swap_quote(
+                        qty_ami_est,
+                        from_token_address=settings.ami_token_address,
+                        to_token_address=settings.apt_token_address,
+                        slippage_pct=settings.panora_api_slippage_pct,
+                    )
+                    if self.trade_executor:
+                        asyncio.create_task(
+                            self.trade_executor.execute_triangular(
+                                direction="AMI_TO_APT",
+                                cex_name=cex_name,
+                                apt_symbol=self.apt_cex_symbol,
+                                ami_symbol=self.cex_symbol,
+                                qty_ami=qty_ami_est,
+                                cex_ami_ask=cex_ami.ask,
+                                cex_apt_bid=cex_apt.bid,
+                                prefetched_quote=prefetched,
+                            ),
+                            name="exec_tri_dir2_skip_verify",
+                        )
+                    return
                 logger.info(
                     f"🔍 [TRI-DIR2] {cex_name} | "
                     f"Panora AMI→APT={pan_ami_apt.ask:.8f}  "
                     f"CEX-implied={cex_implied_rev:.8f}  "
                     f"spread={spread_pct_rev:+.3f}%  est_profit={profit_est:.4f} USDT"
                 )
+                _vkey = f"TRI_DIR2_{cex_name}"
+                if time.time() - self._last_verify.get(_vkey, 0) < self._VERIFY_COOLDOWN_S:
+                    return
+                self._last_verify[_vkey] = time.time()
                 result = await self._verify_panora_ami_to_apt(qty_ami_est)
                 if result:
                     v_rate, v_quote = result
                     slippage = (v_rate - pan_ami_apt.ask) / pan_ami_apt.ask * 100
-                    v_apt_out  = qty_ami_est * v_rate
+                    
+                    # Allow slippage tolerance: if actual rate is worse than expected by
+                    # more than tolerance, use expected rate for profit calc (pessimistic)
+                    adjusted_rate = v_rate
+                    if slippage < -self.slippage_tolerance_pct * 100:
+                        adjusted_rate = pan_ami_apt.ask * (1 - self.slippage_tolerance_pct)
+                        logger.warning(
+                            f"⚠️ [TRI-DIR2] Slippage {slippage:.3f}% exceeds tolerance "
+                            f"{-self.slippage_tolerance_pct*100:.3f}% — using conservative rate"
+                        )
+                    
+                    v_apt_out  = qty_ami_est * adjusted_rate
                     v_usdt_out = v_apt_out * cex_apt.bid
                     v_fees = (
                         notional       * cex_fee
@@ -530,23 +672,57 @@ class ArbitrageEngine:
             bybit = cex_prices.get("bybit")
             mexc  = cex_prices.get("mexc")
 
-            if self.enable_bybit_arb and self.enable_mexc_arb and bybit and mexc:
-                self._check_cex_cex(bybit, mexc)
+            # [DISABLED] Tầng 1: CEX-CEX
+            # if self.enable_bybit_arb and self.enable_mexc_arb and bybit and mexc:
+            #     self._check_cex_cex(bybit, mexc)
 
-            # ── DEX-CEX: Panora AMI/USDT <-> Bybit/MEXC ──
-            panora_prices = self.collector.get(self._sym_ami_usdt)
-            panora        = panora_prices.get("panora")
-
-            if self.enable_panora_arb and self.enable_bybit_arb and panora and bybit:
-                await self._check_dex_cex(panora, bybit, "Bybit")
-            if self.enable_panora_arb and self.enable_mexc_arb and panora and mexc:
-                await self._check_dex_cex(panora, mexc, "MEXC")
+            # [DISABLED] Tầng 2: DEX-CEX Panora AMI/USDT <-> Bybit/MEXC
+            # panora_prices = self.collector.get(self._sym_ami_usdt)
+            # panora        = panora_prices.get("panora")
+            # if self.enable_panora_arb and self.enable_bybit_arb and panora and bybit:
+            #     await self._check_dex_cex(panora, bybit, "Bybit")
+            # if self.enable_panora_arb and self.enable_mexc_arb and panora and mexc:
+            #     await self._check_dex_cex(panora, mexc, "MEXC")
 
             # ── Triangular: Panora APT/AMI vs CEX implied rate ──
             if self.enable_panora_arb and self.panora_apt_client:
                 apt_prices = self.collector.get(self.apt_cex_symbol)
                 bybit_apt  = apt_prices.get("bybit")
                 mexc_apt   = apt_prices.get("mexc")
+
+                # ── Periodic price summary log ──
+                now = time.time()
+                if now - self._last_price_log >= self._PRICE_LOG_INTERVAL_S:
+                    self._last_price_log = now
+                    pan_apt_ami_px = self.collector.get(self._sym_apt_ami).get("panora")
+                    pan_ami_apt_px = self.collector.get(self._sym_ami_apt).get("panora")
+
+                    apt_ask = bybit_apt.ask if bybit_apt else (mexc_apt.ask if mexc_apt else None)
+                    apt_bid = bybit_apt.bid if bybit_apt else (mexc_apt.bid if mexc_apt else None)
+                    ami_ask = bybit.ask    if bybit    else (mexc.ask    if mexc    else None)
+                    ami_bid = bybit.bid    if bybit    else (mexc.bid    if mexc    else None)
+
+                    apt_str = f"{apt_bid:.4f}/{apt_ask:.4f}" if apt_ask else "N/A"
+                    ami_str = f"{ami_bid:.6f}/{ami_ask:.6f}" if ami_ask else "N/A"
+
+                    apt_ami_str = f"{pan_apt_ami_px.ask:.4f}" if pan_apt_ami_px and not pan_apt_ami_px.is_stale() else "N/A"
+                    ami_apt_str = f"{pan_ami_apt_px.ask:.8f}" if pan_ami_apt_px and not pan_ami_apt_px.is_stale() else "N/A"
+
+                    # CEX implied rates
+                    if apt_ask and ami_ask and ami_bid and apt_bid:
+                        implied_apt_ami = apt_bid / ami_ask
+                        implied_ami_apt = ami_bid / apt_ask
+                        implied_str = f"CEX-implied APT/AMI={implied_apt_ami:.4f}  AMI/APT={implied_ami_apt:.8f}"
+                    else:
+                        implied_str = ""
+
+                    logger.info(
+                        f"[PRICES] "
+                        f"APT/USDT={apt_str}  "
+                        f"AMI/USDT={ami_str}  "
+                        f"Panora APT→AMI={apt_ami_str}  AMI→APT={ami_apt_str}  "
+                        f"{implied_str}"
+                    )
 
                 if self.enable_bybit_arb and bybit and bybit_apt:
                     await self._check_triangular_apt_ami(bybit, bybit_apt, "Bybit")

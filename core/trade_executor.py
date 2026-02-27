@@ -14,10 +14,13 @@ from __future__ import annotations
 import asyncio
 from typing import Optional, TYPE_CHECKING
 
+import math
+import time
+
 from config.settings import settings
 from exchanges.bybit_trader import BybitTrader
 from exchanges.mexc_trader import MexcTrader
-from utils.logger import get_logger
+from utils.logger import get_logger, log_signal
 
 if TYPE_CHECKING:
     from exchanges.panora_executor import PanoraExecutor
@@ -56,6 +59,40 @@ class TradeExecutor:
         return self._tri_lock
 
     # ------------------------------------------------------------------ #
+    #  Signal logging helper
+    # ------------------------------------------------------------------ #
+    def _emit_signal(self, payload: dict) -> None:
+        """Write a structured signal block to console + logs/signals.jsonl.
+
+        Every signal includes mode (DRY/LIVE) and timestamp so offline
+        analysis can distinguish paper signals from real executions.
+        """
+        payload["dry_run"] = self.dry_run
+        payload["ts"]      = time.time()
+
+        mode_tag = "[DRY-SIGNAL]" if self.dry_run else "[LIVE-SIGNAL]"
+
+        lines = [f"\n{'━'*56}  {mode_tag}"]
+        for k, v in payload.items():
+            if k in ("dry_run", "ts"):
+                continue
+            if isinstance(v, float):
+                lines.append(f"  {k:<22}: {v:.8g}")
+            elif isinstance(v, dict):
+                lines.append(f"  {k:<22}:")
+                for bk, bv in v.items():
+                    status = "✅" if bv.get("ok") else "⚠️ LOW"
+                    lines.append(
+                        f"    {bk:<20}: bal={bv.get('bal')!s:>12}  "
+                        f"need={bv.get('need')!s:>12}  {status}"
+                    )
+            else:
+                lines.append(f"  {k:<22}: {v}")
+        lines.append(f"{'━'*64}")
+        logger.info("\n".join(lines))
+        log_signal(payload)
+
+    # ------------------------------------------------------------------ #
     #  CEX ↔ CEX  (Bybit / MEXC)
     # ------------------------------------------------------------------ #
     async def execute_cex_cex(
@@ -76,14 +113,34 @@ class TradeExecutor:
         max_qty = settings.trade_amount_usdt / buy_price
         safe_qty = min(qty, max_qty)
 
+        buy_fee  = settings.bybit_fee if buy_exchange  == "Bybit" else settings.mexc_fee
+        sell_fee = settings.bybit_fee if sell_exchange == "Bybit" else settings.mexc_fee
+        net_profit_est = (
+            (sell_price - buy_price) * safe_qty
+            - buy_price  * safe_qty * buy_fee
+            - sell_price * safe_qty * sell_fee
+        )
+
         logger.info(
             f"{'[DRY]' if self.dry_run else '[LIVE]'} CEX-CEX EXECUTE | "
             f"BUY {buy_exchange} @ {buy_price:.8f}  "
             f"SELL {sell_exchange} @ {sell_price:.8f}  "
-            f"QTY={safe_qty:.6f} {symbol}"
+            f"QTY={safe_qty:.6f} {symbol}  PROFIT_EST={net_profit_est:.4f} USDT"
         )
 
         if self.dry_run:
+            self._emit_signal({
+                "type":          "CEX_CEX",
+                "symbol":        symbol,
+                "buy_exchange":  buy_exchange,
+                "sell_exchange": sell_exchange,
+                "buy_price":     buy_price,
+                "sell_price":    sell_price,
+                "qty":           safe_qty,
+                "buy_volume_usdt": buy_price * safe_qty,
+                "sell_volume_usdt": sell_price * safe_qty,
+                "profit_usdt":   net_profit_est,
+            })
             return True
 
         # ---- real execution ---- #
@@ -131,13 +188,31 @@ class TradeExecutor:
         max_qty = settings.trade_amount_usdt / buy_price
         safe_qty = min(qty, max_qty)
 
+        notional_buy  = buy_price  * safe_qty
+        notional_sell = sell_price * safe_qty
+        fee_rate_cex  = settings.bybit_fee if cex_name == "Bybit" else settings.mexc_fee
+        net_profit_est = notional_sell - notional_buy - notional_buy * settings.panora_fee - notional_sell * fee_rate_cex
+
         logger.info(
             f"{'[DRY]' if self.dry_run else '[LIVE]'} DEX-CEX EXECUTE | "
             f"dir={direction} cex={cex_name} "
-            f"buy@{buy_price:.8f} sell@{sell_price:.8f} QTY={safe_qty:.6f}"
+            f"buy@{buy_price:.8f} sell@{sell_price:.8f} QTY={safe_qty:.6f} "
+            f"PROFIT_EST={net_profit_est:.4f} USDT"
         )
 
         if self.dry_run:
+            self._emit_signal({
+                "type":          "DEX_CEX",
+                "direction":     direction,
+                "cex":           cex_name,
+                "symbol":        cex_symbol,
+                "buy_price":     buy_price,
+                "sell_price":    sell_price,
+                "qty":           safe_qty,
+                "buy_volume_usdt":  notional_buy,
+                "sell_volume_usdt": notional_sell,
+                "profit_usdt":   net_profit_est,
+            })
             return True
 
         # ---- real execution ---- #
@@ -149,6 +224,7 @@ class TradeExecutor:
                 from_token_address=settings.usdt_token_address,
                 to_token_address=settings.ami_token_address,
                 prefetched_quote=prefetched_quote,
+                trade_type="DEX_CEX",
             )
             cex_task = self._cex_sell(cex_name, cex_symbol, safe_qty)
 
@@ -160,6 +236,7 @@ class TradeExecutor:
                 from_token_address=settings.ami_token_address,
                 to_token_address=settings.usdt_token_address,
                 prefetched_quote=prefetched_quote,
+                trade_type="DEX_CEX",
             )
         else:
             logger.error(f"TradeExecutor: unknown direction={direction}")
@@ -248,12 +325,12 @@ class TradeExecutor:
     ) -> bool:
         """Inner execution (called while _tri_lock is held)."""
 
-        wallet = getattr(
-            self.panora_executor._get_account(),
-            "account_address",
-            None,
-        )
-        wallet_str = str(wallet) if wallet else None
+        wallet_str: Optional[str] = None
+        if self.panora_executor:
+            acct = self.panora_executor._get_account()
+            if acct is not None:
+                raw = getattr(acct, "account_address", None) or getattr(acct, "address", None)
+                wallet_str = str(raw) if raw is not None else None
 
         if direction == "APT_TO_AMI":
             safe_qty    = min(qty_apt, settings.trade_amount_usdt / max(cex_apt_ask, 1e-12))
@@ -265,12 +342,27 @@ class TradeExecutor:
             )
 
             if self.dry_run:
+                # In dry-run: still run balance check so we can report funding status
+                bal_check = await self._check_tri_balances_apt_to_ami(
+                    cex_name, wallet_str, safe_qty, ami_to_sell
+                )
+                notional_in  = safe_qty * cex_apt_ask
+                notional_out = ami_to_sell * cex_ami_bid
+                net_profit   = notional_out - notional_in - notional_in * settings.panora_fee - notional_out * (settings.bybit_fee if cex_name == "Bybit" else settings.mexc_fee)
+                self._emit_signal({
+                    "type":             "TRI_APT_TO_AMI",
+                    "cex":              cex_name,
+                    "apt_qty":          safe_qty,
+                    "apt_buy_price":    cex_apt_ask,
+                    "ami_qty_est":      ami_to_sell,
+                    "ami_sell_price":   cex_ami_bid,
+                    "notional_in_usdt": notional_in,
+                    "notional_out_usdt":notional_out,
+                    "profit_usdt":      net_profit,
+                    "balance_gate":     "PASS" if bal_check else "FAIL",
+                    "wallet":           wallet_str or "N/A",
+                })
                 return True
-
-            # --- Balance gate ---
-            if not await self._check_tri_balances_apt_to_ami(
-                cex_name, wallet_str, safe_qty, ami_to_sell
-            ):
                 return False
 
             # Leg 1: Panora APT→AMI (with timeout)
@@ -281,6 +373,7 @@ class TradeExecutor:
                         from_token_address=settings.apt_token_address,
                         to_token_address=settings.ami_token_address,
                         prefetched_quote=prefetched_quote,
+                        trade_type="TRI",
                     ),
                     timeout=_LEG_TIMEOUT_S,
                 )
@@ -327,12 +420,27 @@ class TradeExecutor:
             )
 
             if self.dry_run:
+                # In dry-run: still run balance check so we can report funding status
+                bal_check = await self._check_tri_balances_ami_to_apt(
+                    cex_name, wallet_str, safe_qty, apt_to_sell
+                )
+                notional_in  = safe_qty * cex_ami_ask
+                notional_out = apt_to_sell * cex_apt_bid
+                net_profit   = notional_out - notional_in - notional_in * settings.panora_fee - notional_out * (settings.bybit_fee if cex_name == "Bybit" else settings.mexc_fee)
+                self._emit_signal({
+                    "type":             "TRI_AMI_TO_APT",
+                    "cex":              cex_name,
+                    "ami_qty":          safe_qty,
+                    "ami_buy_price":    cex_ami_ask,
+                    "apt_qty_est":      apt_to_sell,
+                    "apt_sell_price":   cex_apt_bid,
+                    "notional_in_usdt": notional_in,
+                    "notional_out_usdt":notional_out,
+                    "profit_usdt":      net_profit,
+                    "balance_gate":     "PASS" if bal_check else "FAIL",
+                    "wallet":           wallet_str or "N/A",
+                })
                 return True
-
-            # --- Balance gate ---
-            if not await self._check_tri_balances_ami_to_apt(
-                cex_name, wallet_str, safe_qty, apt_to_sell
-            ):
                 return False
 
             # Leg 1: Panora AMI→APT (with timeout)
@@ -343,6 +451,7 @@ class TradeExecutor:
                         from_token_address=settings.ami_token_address,
                         to_token_address=settings.apt_token_address,
                         prefetched_quote=prefetched_quote,
+                        trade_type="TRI",
                     ),
                     timeout=_LEG_TIMEOUT_S,
                 )
@@ -486,9 +595,12 @@ class TradeExecutor:
         qty: float,
         price: float,
     ) -> Optional[str]:
-        """Buy `qty` AMI at approximate `price` (market order, qty in base)."""
+        """Buy `qty` base coin (market order, qty in base)."""
+        qty = _floor_qty(qty)
+        if qty <= 0:
+            logger.error(f"_cex_buy: qty rounded to zero for {symbol}")
+            return None
         if exchange == "Bybit":
-            # Bybit Buy: use baseCoinQty
             return await self.bybit.place_market_order(
                 symbol, "Buy", qty, market_unit="baseCoinQty"
             )
@@ -506,7 +618,11 @@ class TradeExecutor:
         symbol: str,
         qty: float,
     ) -> Optional[str]:
-        """Sell `qty` AMI (market order)."""
+        """Sell `qty` base coin (market order)."""
+        qty = _floor_qty(qty)
+        if qty <= 0:
+            logger.error(f"_cex_sell: qty rounded to zero for {symbol}")
+            return None
         if exchange == "Bybit":
             return await self.bybit.place_market_order(
                 symbol, "Sell", qty, market_unit="baseCoinQty"
@@ -536,3 +652,22 @@ def _cex_coin_for(cex_symbol: str) -> str:
         if cex_symbol.endswith(stable):
             return cex_symbol[: -len(stable)]
     return cex_symbol
+
+
+def _floor_qty(qty: float) -> float:
+    """Floor quantity to a sane exchange lot-size precision.
+
+    Rules (conservative):
+      qty ≥ 100  → integer (AMI-scale)     e.g.  1222.3 → 1222
+      qty ≥ 1    → 2 decimal places         e.g.  10.416 → 10.41
+      qty ≥ 0.01 → 4 decimal places         e.g.  0.2083 → 0.2083
+      otherwise  → 6 decimal places
+    """
+    if qty >= 100:
+        return float(math.floor(qty))
+    elif qty >= 1:
+        return math.floor(qty * 100) / 100
+    elif qty >= 0.01:
+        return math.floor(qty * 10_000) / 10_000
+    else:
+        return math.floor(qty * 1_000_000) / 1_000_000

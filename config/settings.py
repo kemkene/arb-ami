@@ -55,7 +55,17 @@ class Settings:
         default_factory=lambda: float(os.getenv("MEXC_FEE", "0.001"))
     )
     panora_fee: float = field(
-        default_factory=lambda: float(os.getenv("PANORA_FEE", "0.003"))
+        default_factory=lambda: float(os.getenv("PANORA_FEE", "0.001"))
+    )
+
+    # Slippage tolerance (allow this much worse rate when verifying)
+    # Default: equal to Panora fee (0.1% = 0.001)
+    slippage_tolerance_pct: float = field(
+        default_factory=lambda: float(os.getenv("SLIPPAGE_TOLERANCE_PCT", "0.1"))
+    )
+    # Fixed Panora API slippage overhead
+    panora_api_slippage_pct: float = field(
+        default_factory=lambda: float(os.getenv("PANORA_API_SLIPPAGE_PCT", "0.1"))
     )
 
     # Intervals (seconds)
@@ -67,6 +77,10 @@ class Settings:
     )
     arb_check_interval: float = field(
         default_factory=lambda: float(os.getenv("ARB_CHECK_INTERVAL", "0.1"))
+    )
+    # Panora API rate limit (seconds between consecutive calls)
+    panora_api_min_interval: float = field(
+        default_factory=lambda: float(os.getenv("PANORA_API_MIN_INTERVAL", "0.91"))
     )
 
     # Minimum profit to log
@@ -84,6 +98,28 @@ class Settings:
     # Max USDT value per trade leg (safety cap)
     trade_amount_usdt: float = field(
         default_factory=lambda: float(os.getenv("TRADE_AMOUNT_USDT", "10.0"))
+    )
+
+    # Skip Panora verify calls (use latest quote for execution)
+    skip_panora_verify: bool = field(
+        default_factory=lambda: os.getenv("SKIP_PANORA_VERIFY", "false").lower() == "true"
+    )
+
+    # Max age (seconds) for cached execution quotes with txData
+    exec_quote_max_age_s: float = field(
+        default_factory=lambda: float(os.getenv("EXEC_QUOTE_MAX_AGE_S", "2.0"))
+    )
+    # Max age for DEX-CEX quotes (typically faster markets)
+    dex_cex_quote_max_age_s: float = field(
+        default_factory=lambda: float(os.getenv("DEX_CEX_QUOTE_MAX_AGE_S", "1.5"))
+    )
+    # Max age for triangular quotes (more complex, can tolerate slightly older)
+    tri_quote_max_age_s: float = field(
+        default_factory=lambda: float(os.getenv("TRI_QUOTE_MAX_AGE_S", "2.5"))
+    )
+    # Price deviation threshold (%) - force fresh if cached price differs by more than this
+    quote_price_deviation_threshold_pct: float = field(
+        default_factory=lambda: float(os.getenv("QUOTE_PRICE_DEVIATION_THRESHOLD_PCT", "0.5"))
     )
 
     # Bybit API credentials

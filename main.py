@@ -104,41 +104,56 @@ async def main() -> None:
     # Validate accounts before anything else
     enable_panora, enable_bybit, enable_mexc = validate_accounts()
 
+    if not enable_bybit:
+        logger.info("[Bybit] feed disabled (missing credentials)")
+    if not enable_mexc:
+        logger.info("[MEXC] feed disabled (missing credentials)")
+    if not enable_panora:
+        logger.info("[Panora] poller disabled (missing Aptos wallet)")
+
     collector = PriceCollector()
 
     # --- Exchange connectors (subscribe to both AMI/USDT and APT/USDT) ---
     cex_symbols = [settings.cex_symbol, settings.apt_cex_symbol]
-    bybit = BybitWS(collector, symbols=cex_symbols)
-    mexc  = MexcWS(collector,  symbols=cex_symbols)
+    bybit = BybitWS(collector, symbols=cex_symbols) if enable_bybit else None
+    mexc  = MexcWS(collector,  symbols=cex_symbols) if enable_mexc else None
 
     # --- Panora pollers: AMI→USDT, APT→AMI, AMI→APT ---
-    panora_ami_usdt = PanoraPoller(
-        collector,
-        from_amount=1.0,
-        from_token_address=settings.ami_token_address,
-        to_token_address=settings.usdt_token_address,
-    )
-    panora_apt_ami = PanoraPoller(
-        collector,
-        from_amount=1.0,
-        from_token_address=settings.apt_token_address,
-        to_token_address=settings.ami_token_address,
-    )
-    panora_ami_apt = PanoraPoller(
-        collector,
-        from_amount=1.0,
-        from_token_address=settings.ami_token_address,
-        to_token_address=settings.apt_token_address,
-    )
+    panora_ami_usdt = None
+    panora_apt_ami = None
+    panora_ami_apt = None
+    if enable_panora:
+        panora_ami_usdt = PanoraPoller(
+            collector,
+            from_amount=1.0,
+            from_token_address=settings.ami_token_address,
+            to_token_address=settings.usdt_token_address,
+        )
+        panora_apt_ami = PanoraPoller(
+            collector,
+            from_amount=1.0,
+            from_token_address=settings.apt_token_address,
+            to_token_address=settings.ami_token_address,
+            also_update_inverse=True,   # derives AMI→APT price for free (1/price)
+        )
+        # panora_ami_apt: NOT polled — price derived from apt_ami inverse above.
+        # Client object kept only so the arb engine can fire verify calls directly.
+        panora_ami_apt = PanoraPoller(
+            collector,
+            from_amount=1.0,
+            from_token_address=settings.ami_token_address,
+            to_token_address=settings.apt_token_address,
+        )
 
     # --- Trade execution ---
-    panora_executor = PanoraExecutor(panora_ami_usdt.client)
-    trade_executor  = TradeExecutor(panora_executor=panora_executor)
+    panora_executor = PanoraExecutor(panora_ami_usdt.client) if panora_ami_usdt else None
+    trade_executor  = TradeExecutor(panora_executor=panora_executor) if panora_executor else None
 
     arb = ArbitrageEngine(
         collector,
-        panora_client=panora_ami_usdt.client,
-        panora_apt_client=panora_apt_ami.client,   # used for APT↔AMI triangular verify
+        panora_client=panora_ami_usdt.client if panora_ami_usdt else None,
+        panora_apt_client=panora_apt_ami.client if panora_apt_ami else None,
+        panora_ami_apt_client=panora_ami_apt.client if panora_ami_apt else None,
         trade_executor=trade_executor,
         enable_panora_arb=enable_panora,
         enable_bybit_arb=enable_bybit,
@@ -157,14 +172,20 @@ async def main() -> None:
         loop.add_signal_handler(sig, _signal_handler)
 
     # --- Launch all tasks ---
-    tasks = [
-        asyncio.create_task(bybit.connect(),          name="bybit"),
-        asyncio.create_task(mexc.connect(),           name="mexc"),
-        asyncio.create_task(panora_ami_usdt.poll(),   name="panora_ami_usdt"),
-        asyncio.create_task(panora_apt_ami.poll(),    name="panora_apt_ami"),
-        asyncio.create_task(panora_ami_apt.poll(),    name="panora_ami_apt"),
-        asyncio.create_task(arb.run(),                name="arb_engine"),
-    ]
+    tasks = []
+    if bybit:
+        tasks.append(asyncio.create_task(bybit.connect(), name="bybit"))
+    if mexc:
+        tasks.append(asyncio.create_task(mexc.connect(), name="mexc"))
+    if panora_ami_usdt:
+        tasks.append(asyncio.create_task(panora_ami_usdt.poll(), name="panora_ami_usdt"))
+    if panora_apt_ami:
+        tasks.append(asyncio.create_task(panora_apt_ami.poll(), name="panora_apt_ami"))
+    # panora_ami_apt is NOT polled — price derived from apt_ami inverse
+    if enable_panora or enable_bybit or enable_mexc:
+        tasks.append(asyncio.create_task(arb.run(), name="arb_engine"))
+    else:
+        logger.warning("[Arb] All exchanges disabled — arb engine not started")
 
     logger.info(
         f"Arb bot started | symbols={cex_symbols} "
@@ -181,10 +202,14 @@ async def main() -> None:
     await asyncio.gather(*tasks, return_exceptions=True)
 
     # Close Panora sessions
-    await panora_ami_usdt.close()
-    await panora_apt_ami.close()
-    await panora_ami_apt.close()
-    await panora_executor.close()
+    if panora_ami_usdt:
+        await panora_ami_usdt.close()
+    if panora_apt_ami:
+        await panora_apt_ami.close()
+    if panora_ami_apt:
+        await panora_ami_apt.close()
+    if panora_executor:
+        await panora_executor.close()
 
     logger.info("Arb bot shut down cleanly.")
 

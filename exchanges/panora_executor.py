@@ -23,6 +23,7 @@ from aptos_sdk.async_client import RestClient
 from aptos_sdk.bcs import Serializer
 from aptos_sdk.transactions import (
     EntryFunction,
+    ModuleId,
     TransactionPayload,
 )
 from aptos_sdk.type_tag import StructTag, TypeTag
@@ -283,8 +284,9 @@ class PanoraExecutor:
         from_amount: float,
         from_token_address: str,
         to_token_address: str,
-        slippage_pct: float = 1.0,
+        slippage_pct: float | None = None,
         prefetched_quote: Optional[Dict[str, Any]] = None,
+        trade_type: str = "GENERIC",  # "DEX_CEX" | "TRI" | "GENERIC"
     ) -> Optional[str]:
         """Execute a Panora swap. Returns confirmed Aptos tx hash, or None.
 
@@ -299,6 +301,23 @@ class PanoraExecutor:
             return None
 
         wallet = str(account.address())
+
+        # ── Preflight: check from-token balance when possible ─────────
+        decimals: Optional[int] = None
+        if from_token_address == settings.apt_token_address:
+            decimals = self.APT_DECIMALS
+        elif from_token_address == settings.ami_token_address:
+            decimals = getattr(settings, "ami_decimals", 8)
+        elif from_token_address == settings.usdt_token_address:
+            decimals = getattr(settings, "usdt_decimals", 6)
+        if decimals is not None:
+            bal = await self.get_token_balance(wallet, from_token_address, decimals=decimals)
+            if bal is not None and bal < from_amount:
+                logger.warning(
+                    f"PanoraExecutor: insufficient token balance | "
+                    f"have={bal:.6f} need={from_amount:.6f}"
+                )
+                return None
 
         # ── Step 1: ensure PanoraClient sends toWalletAddress ─────────
         self.panora_client.to_wallet_address = wallet
@@ -320,14 +339,62 @@ class PanoraExecutor:
                     f"fetching execution quote with force_fresh "
                     f"(from={from_token_address[:16]}… amount={from_amount})"
                 )
-            # force_fresh=True bypasses both caches so we always get a real
-            # response with txData for on-chain execution.
-            quote = await self.panora_client.get_swap_quote(
+            
+            # Chọn max_age dựa vào trade_type
+            if trade_type == "DEX_CEX":
+                max_age = settings.dex_cex_quote_max_age_s
+            elif trade_type == "TRI":
+                max_age = settings.tri_quote_max_age_s
+            else:
+                max_age = settings.exec_quote_max_age_s
+
+            # Lấy cached quote với max_age phù hợp
+            cached = self.panora_client.get_cached_execution_quote(
+                from_token_address,
+                to_token_address,
                 from_amount,
-                from_token_address=from_token_address,
-                to_token_address=to_token_address,
-                force_fresh=True,
+                max_age_s=max_age,
             )
+
+            if cached is not None:
+                # Check price deviation trước khi dùng
+                within_threshold, deviation = self.panora_client.check_quote_price_deviation(
+                    cached,
+                    from_token_address,
+                    to_token_address,
+                    from_amount,
+                    settings.quote_price_deviation_threshold_pct,
+                )
+
+                if within_threshold:
+                    quote = cached
+                    logger.debug(
+                        f"PanoraExecutor: reusing cached execution quote "
+                        f"(from={from_token_address[:16]}… amount={from_amount} "
+                        f"deviation={deviation:.3f}% type={trade_type})"
+                    )
+                else:
+                    logger.warning(
+                        f"PanoraExecutor: cached quote deviation {deviation:.3f}% "
+                        f"exceeds threshold {settings.quote_price_deviation_threshold_pct:.3f}% "
+                        f"→ fetching fresh quote"
+                    )
+                    cached = None  # Force fresh below
+
+            if cached is None:
+                # force_fresh=True bypasses both caches so we always get a real
+                # response with txData for on-chain execution.
+                effective_slippage = (
+                    settings.panora_api_slippage_pct
+                    if slippage_pct is None else slippage_pct
+                )
+                quote = await self.panora_client.get_swap_quote(
+                    from_amount,
+                    from_token_address=from_token_address,
+                    to_token_address=to_token_address,
+                    force_fresh=True,
+                    slippage_pct=effective_slippage,
+                )
         if not quote:
             logger.error("PanoraExecutor: swap quote request failed")
             return None
@@ -380,10 +447,18 @@ class PanoraExecutor:
             logger.error(f"PanoraExecutor: type tag parsing failed: {e}")
             return None
 
-        parts        = func.split("::")
-        module_str   = "::".join(parts[:-1])
+        parts         = func.split("::")
+        module_str    = "::".join(parts[:-1])
         function_name = parts[-1]
-        entry_fn = EntryFunction.natural(module_str, function_name, type_tags, bcs_args)
+        # Use the EntryFunction constructor directly — our bcs_args are already
+        # List[bytes] (pre-BCS-encoded).  EntryFunction.natural() expects
+        # TransactionArgument objects and would crash calling .encode() on bytes.
+        entry_fn = EntryFunction(
+            ModuleId.from_str(module_str),
+            function_name,
+            type_tags,
+            bcs_args,
+        )
 
         # ── Step 5: check APT balance → compute max_gas_amount ─────────
         apt_octas = await self._check_apt_balance(wallet)

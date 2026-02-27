@@ -71,7 +71,7 @@ class PriceCollector:
 
         self._prices.setdefault(symbol, {})
         self._prices[symbol][exchange] = PriceData(bid, ask, bid_qty, ask_qty)
-        logger.info(
+        logger.debug(
             f"{exchange} {symbol} bid={bid} ask={ask} "
             f"bid_qty={bid_qty} ask_qty={ask_qty}"
         )
