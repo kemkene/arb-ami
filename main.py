@@ -4,45 +4,24 @@ from typing import Tuple
 
 from config.settings import settings
 from core.arbitrage_engine import ArbitrageEngine
+from core.cellana_swap_listener import CellanaSwapListener
 from core.price_collector import PriceCollector
 from core.trade_executor import TradeExecutor
 from exchanges.bybit import BybitWS
 from exchanges.mexc import MexcWS
-from exchanges.panora_poller import PanoraPoller
-from exchanges.panora_executor import PanoraExecutor
 from utils.logger import get_logger
 
 logger = get_logger()
 
 
-def validate_accounts() -> Tuple[bool, bool, bool]:
+def validate_accounts() -> Tuple[bool, bool]:
     """Check which exchange accounts are configured and log results.
 
-    Returns (enable_panora, enable_bybit, enable_mexc).
+    Returns (enable_bybit, enable_mexc).
     An exchange is "enabled" only when its credentials are present and
     parseable — otherwise the arb engine skips that direction entirely.
     """
     logger.info("━━━━━━━━━━━━━━━━━━━━  ACCOUNT VALIDATION  ━━━━━━━━━━━━━━━━━━━━")
-
-    # ── Aptos / Panora ────────────────────────────────────────────────
-    enable_panora = False
-    if not settings.aptos_private_key:
-        logger.warning("[Panora/Aptos] ✗  APTOS_PRIVATE_KEY not set → DEX arb DISABLED")
-    else:
-        try:
-            from aptos_sdk.account import Account
-            acct = Account.load_key(settings.aptos_private_key)
-            addr = str(acct.address())
-            enable_panora = True
-            logger.success(
-                f"[Panora/Aptos] ✓  wallet loaded → {addr[:20]}…"
-                f"  (arb ENABLED)"
-            )
-        except Exception as e:
-            logger.error(
-                f"[Panora/Aptos] ✗  APTOS_PRIVATE_KEY invalid ({e}) "
-                f"→ DEX arb DISABLED"
-            )
 
     # ── Bybit ─────────────────────────────────────────────────────────
     enable_bybit = False
@@ -70,25 +49,12 @@ def validate_accounts() -> Tuple[bool, bool, bool]:
 
     # ── Summary ───────────────────────────────────────────────────────
     enabled = []
-    if enable_panora:
-        enabled.append("Panora")
     if enable_bybit:
         enabled.append("Bybit")
     if enable_mexc:
         enabled.append("MEXC")
 
     if enabled:
-        # Warn about combinations that can't form a full arb leg
-        if enable_panora and not (enable_bybit or enable_mexc):
-            logger.warning(
-                "[Arb] Panora enabled but no CEX credentials → "
-                "DEX-CEX arb requires at least one of Bybit/MEXC"
-            )
-        if (enable_bybit or enable_mexc) and not enable_panora:
-            logger.warning(
-                "[Arb] CEX(s) enabled but no Aptos wallet → "
-                "only CEX-CEX arb (Bybit↔MEXC) will run"
-            )
         logger.info(f"[Arb] Active exchanges: {', '.join(enabled)}")
     else:
         logger.error(
@@ -97,19 +63,17 @@ def validate_accounts() -> Tuple[bool, bool, bool]:
         )
 
     logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    return enable_panora, enable_bybit, enable_mexc
+    return enable_bybit, enable_mexc
 
 
 async def main() -> None:
     # Validate accounts before anything else
-    enable_panora, enable_bybit, enable_mexc = validate_accounts()
+    enable_bybit, enable_mexc = validate_accounts()
 
     if not enable_bybit:
         logger.info("[Bybit] feed disabled (missing credentials)")
     if not enable_mexc:
         logger.info("[MEXC] feed disabled (missing credentials)")
-    if not enable_panora:
-        logger.info("[Panora] poller disabled (missing Aptos wallet)")
 
     collector = PriceCollector()
 
@@ -118,47 +82,22 @@ async def main() -> None:
     bybit = BybitWS(collector, symbols=cex_symbols) if enable_bybit else None
     mexc  = MexcWS(collector,  symbols=cex_symbols) if enable_mexc else None
 
-    # --- Panora pollers: AMI→USDT, APT→AMI, AMI→APT ---
-    panora_ami_usdt = None
-    panora_apt_ami = None
-    panora_ami_apt = None
-    if enable_panora:
-        panora_ami_usdt = PanoraPoller(
-            collector,
-            from_amount=1.0,
-            from_token_address=settings.ami_token_address,
-            to_token_address=settings.usdt_token_address,
-        )
-        panora_apt_ami = PanoraPoller(
-            collector,
-            from_amount=1.0,
-            from_token_address=settings.apt_token_address,
-            to_token_address=settings.ami_token_address,
-            also_update_inverse=True,   # derives AMI→APT price for free (1/price)
-        )
-        # panora_ami_apt: NOT polled — price derived from apt_ami inverse above.
-        # Client object kept only so the arb engine can fire verify calls directly.
-        panora_ami_apt = PanoraPoller(
-            collector,
-            from_amount=1.0,
-            from_token_address=settings.ami_token_address,
-            to_token_address=settings.apt_token_address,
-        )
-
     # --- Trade execution ---
-    panora_executor = PanoraExecutor(panora_ami_usdt.client) if panora_ami_usdt else None
-    trade_executor  = TradeExecutor(panora_executor=panora_executor) if panora_executor else None
+    trade_executor  = TradeExecutor()
 
     arb = ArbitrageEngine(
         collector,
-        panora_client=panora_ami_usdt.client if panora_ami_usdt else None,
-        panora_apt_client=panora_apt_ami.client if panora_apt_ami else None,
-        panora_ami_apt_client=panora_ami_apt.client if panora_ami_apt else None,
         trade_executor=trade_executor,
-        enable_panora_arb=enable_panora,
         enable_bybit_arb=enable_bybit,
         enable_mexc_arb=enable_mexc,
     )
+
+    cellana_listener = None
+    if settings.cellana_swap_listener_enabled:
+        cellana_listener = CellanaSwapListener()
+        logger.info("[Cellana] swap listener enabled")
+    else:
+        logger.info("[Cellana] swap listener disabled")
 
     # --- Graceful shutdown ---
     shutdown_event = asyncio.Event()
@@ -177,20 +116,16 @@ async def main() -> None:
         tasks.append(asyncio.create_task(bybit.connect(), name="bybit"))
     if mexc:
         tasks.append(asyncio.create_task(mexc.connect(), name="mexc"))
-    if panora_ami_usdt:
-        tasks.append(asyncio.create_task(panora_ami_usdt.poll(), name="panora_ami_usdt"))
-    if panora_apt_ami:
-        tasks.append(asyncio.create_task(panora_apt_ami.poll(), name="panora_apt_ami"))
-    # panora_ami_apt is NOT polled — price derived from apt_ami inverse
-    if enable_panora or enable_bybit or enable_mexc:
+    if enable_bybit or enable_mexc:
         tasks.append(asyncio.create_task(arb.run(), name="arb_engine"))
     else:
         logger.warning("[Arb] All exchanges disabled — arb engine not started")
+    if cellana_listener:
+        tasks.append(asyncio.create_task(cellana_listener.run(), name="cellana_swaps"))
 
     logger.info(
         f"Arb bot started | symbols={cex_symbols} "
-        f"bybit_fee={settings.bybit_fee*100:.2f}% mexc_fee={settings.mexc_fee*100:.2f}% "
-        f"panora_fee={settings.panora_fee*100:.2f}%"
+        f"bybit_fee={settings.bybit_fee*100:.2f}% mexc_fee={settings.mexc_fee*100:.2f}%"
     )
 
     # Wait until shutdown is requested
@@ -200,16 +135,6 @@ async def main() -> None:
     for t in tasks:
         t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
-
-    # Close Panora sessions
-    if panora_ami_usdt:
-        await panora_ami_usdt.close()
-    if panora_apt_ami:
-        await panora_apt_ami.close()
-    if panora_ami_apt:
-        await panora_ami_apt.close()
-    if panora_executor:
-        await panora_executor.close()
 
     logger.info("Arb bot shut down cleanly.")
 
