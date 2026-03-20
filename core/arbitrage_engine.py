@@ -215,7 +215,8 @@ class ArbitrageEngine:
         legs: Optional[list[TradeLeg]] = None,
         profit_est: float = 0.0,
         is_shadow: bool = False,
-        skip_reason: Optional[str] = None
+        skip_reason: Optional[str] = None,
+        log_steps: bool = True
     ) -> None:
         """Centralized logic for de-duplication, logging and execution."""
         # 1. De-duplication
@@ -277,7 +278,11 @@ class ArbitrageEngine:
             asyncio.create_task(self._safe_execute(direction, exec_coro))
 
         # 4. Logging & Notification (ASYNC)
-        asyncio.create_task(self._async_log_and_notify(log_payload))
+        if log_steps and profit_est > self.min_profit:
+            asyncio.create_task(self._async_log_and_notify(log_payload))
+        else:
+            # For shadow or ignored, we might still want basic console log but no JSONL/TG
+            pass
 
     async def _async_log_and_notify(self, log_payload: dict) -> None:
         """Handle background logging and notifications to avoid blocking execution."""
@@ -473,16 +478,18 @@ class ArbitrageEngine:
             best_opp.legs,
             best_opp.profit_usdt,
             is_shadow=is_shadow,
-            skip_reason=skip_reason
+            skip_reason=skip_reason,
+            log_steps=not is_shadow # Only log steps to JSONL if we are actually executing (not shadow)
         )
 
-        # 4. Log remaining feasible ones as shadows
+        # 4. Log remaining profitable ones as shadows
         for opp, _ in feasible_opps:
             if opp == best_opp: continue
-            self._log_and_execute(
-                opp.direction, opp.buy_price, opp.sell_price,
-                opp.log_msg, is_shadow=True, skip_reason="Not best feasible in tournament"
-            )
+            if opp.profit_usdt > self.min_profit:
+                self._log_and_execute(
+                    opp.direction, opp.buy_price, opp.sell_price,
+                    opp.log_msg, is_shadow=True, skip_reason="Not best feasible in tournament"
+                )
 
     # ------------------------------------------------------------------ #
     #  CEX-CEX  (Bybit <-> MEXC, same symbol)
@@ -1173,14 +1180,18 @@ class ArbitrageEngine:
             opportunities = self._check_all_routes(bybit, mexc, bybit_apt, mexc_apt)
             if opportunities:
                 best_opp = max(opportunities, key=lambda x: x.profit_usdt)
-                self._log_and_execute(
-                    best_opp.direction,
-                    best_opp.buy_price,
-                    best_opp.sell_price,
-                    best_opp.log_msg,
-                    best_opp.legs,
-                    best_opp.profit_usdt
-                )
+                if best_opp.profit_usdt > self.min_profit:
+                    self._log_and_execute(
+                        best_opp.direction,
+                        best_opp.buy_price,
+                        best_opp.sell_price,
+                        best_opp.log_msg,
+                        best_opp.legs,
+                        best_opp.profit_usdt
+                    )
+                else:
+                    # Optional: Log as trace or ignore if negative
+                    pass
 
             # Performance Optimization: If gRPC is active, we don't need to poll so fast
             is_streaming = (self.cellana_listener and self.cellana_listener.is_grpc_active) or \
