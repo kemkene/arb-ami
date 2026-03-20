@@ -268,9 +268,10 @@ class ArbitrageEngine:
         if self.trade_executor and legs:
             logger.info(f"🚀 Executing {direction} (Steps: {len(trade_steps)})")
             exec_coro = self.trade_executor.execute_multi_leg(
-                legs,
                 direction=direction,
+                legs=legs,
                 profit_est=profit_est,
+                trade_steps=trade_steps,
                 parallel=False,
             )
             asyncio.create_task(self._safe_execute(direction, exec_coro))
@@ -1164,7 +1165,7 @@ class ArbitrageEngine:
                     f"[PRICES] AMIUSDT | Bybit={bybit_str} MEXC={mexc_str} | "
                     f"APTUSDT Bybit={bybit_apt_str} MEXC={mexc_apt_str} | "
                     f"Cellana={self.cellana_last_spot if self.cellana_last_spot else 'N/A'} APT/AMI "
-                    f"Hyperion={hyperion_spot:.8f if hyperion_spot else 'N/A'} AMI/APT | "
+                    f"Hyperion={f'{hyperion_spot:.8f}' if hyperion_spot else 'N/A'} AMI/APT | "
                     f"Gas: ${self.gas_cost_usd:.4f}"
                 )
 
