@@ -21,10 +21,9 @@ class TestArbitrageEngine(unittest.IsolatedAsyncioTestCase):
         mexc = collector.get_exchange("AMIUSDT", "mexc")
         engine = self._engine_with_zero_fees(collector)
 
-        with patch("core.arbitrage_engine.logger.success") as mock_success:
-            engine._check_cex_cex(bybit, mexc)
-
-        self.assertGreaterEqual(mock_success.call_count, 1)
+        opp = engine._check_cex_cex(bybit, mexc)
+        self.assertIsNotNone(opp)
+        self.assertGreater(opp.profit_usdt, 0)
 
     async def test_check_cex_cex_no_log_when_unprofitable(self):
         collector = PriceCollector()
