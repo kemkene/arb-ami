@@ -10,6 +10,7 @@ from core.price_collector import PriceCollector
 from core.trade_executor import TradeExecutor
 from core.gas_monitor import GasMonitor
 from core.balance_manager import BalanceManager
+from core.rebalance_manager import RebalanceManager
 from exchanges.bybit import BybitWS
 from exchanges.mexc import MexcWS
 from utils.logger import get_logger
@@ -183,6 +184,14 @@ async def main() -> None:
             "hyperion": trade_executor.hyperion_swap
         }
         tasks.append(asyncio.create_task(tg_notifier.run_listener(shutdown_event, context), name="telegram_listener"))
+
+    # --- Rebalance Manager (CEX -> DEX refill) ---
+    if settings.rebalance_enabled:
+        rebalance_min = settings.rebalance_interval_min * 60 if hasattr(settings, "rebalance_interval_min") else 1800
+        rebalancer = RebalanceManager(balance_manager, telegram=tg_notifier, check_interval_s=rebalance_min)
+        tasks.append(asyncio.create_task(rebalancer.run_loop(), name="rebalance_manager"))
+    else:
+        logger.info("⚖️ RebalanceManager is disabled in settings")
 
     logger.info(
         f"Arb bot started | symbols={cex_symbols} "

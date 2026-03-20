@@ -390,4 +390,19 @@ class Settings:
 
 
 
+    # ------------------------------------------------------------------ #
+    #  Rebalance settings
+    # ------------------------------------------------------------------ #
+    rebalance_enabled: bool = field(
+        default_factory=lambda: os.getenv("REBALANCE_ENABLED", "false").lower() == "true"
+    )
+    rebalance_interval_min: float = field(
+        default_factory=lambda: float(os.getenv("REBALANCE_INTERVAL_MIN", "30.0"))
+    )
+    # Address to withdraw to (usually your Aptos wallet)
+    aptos_address: str = field(
+        default_factory=lambda: os.getenv("APTOS_WALLET_ADDRESS", "")
+    )
+
+
 settings = Settings()

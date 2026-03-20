@@ -292,6 +292,63 @@ class MexcTrader:
             logger.error(f"❌ MEXC order exception: {e}")
             return None
 
+    async def withdraw(
+        self,
+        coin: str,
+        amount: float,
+        address: str,
+        network: str,
+        memo: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Request a withdrawal from MEXC. Returns withdrawal ID or None.
+        Endpoint: POST /api/v3/capital/withdraw/apply (Requires 'Withdraw' permission)
+        """
+        if not self._is_configured():
+            logger.error("MexcTrader.withdraw: API key/secret not configured")
+            return None
+
+        await self._ensure_time_synced()
+        timestamp = self._now_ms()
+
+        params = {
+            "coin": coin,
+            "address": address,
+            "amount": str(amount),
+            "network": network,
+            "timestamp": timestamp,
+            "recvWindow": str(_RECV_WINDOW_MS),
+        }
+        if memo:
+            params["memo"] = memo
+
+        query_string = urllib.parse.urlencode(params)
+        params["signature"] = self._sign(query_string)
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{BASE_URL}/api/v3/capital/withdraw/apply",
+                    headers={"X-MEXC-APIKEY": self.api_key},
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    data = await resp.json()
+
+            if "id" in data:
+                withdraw_id = str(data["id"])
+                logger.success(f"✅ MEXC withdrawal requested: {coin} {amount} to {address} | ID={withdraw_id}")
+                return withdraw_id
+            else:
+                logger.error(
+                    f"❌ MEXC withdrawal failed | code={data.get('code')} "
+                    f"msg={data.get('msg')} | coin={coin} amount={amount}"
+                )
+                return None
+        except Exception as e:
+            logger.error(f"❌ MEXC withdrawal exception: {e}")
+            return None
+
     async def close(self) -> None:
         """Cleanup resources."""
         # MexcTrader currently creates a new session per request,

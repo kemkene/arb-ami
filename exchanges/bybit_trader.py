@@ -371,6 +371,71 @@ class BybitTrader:
             logger.error(f"❌ Bybit order exception: {e}")
             return None
 
+    async def withdraw(
+        self,
+        coin: str,
+        amount: float,
+        address: str,
+        chain: str,
+        tag: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Request a withdrawal from Bybit. Returns withdrawal ID or None.
+        Endpoint: POST /v5/asset/withdraw
+        """
+        if not self._is_configured():
+            logger.error("BybitTrader.withdraw: API key/secret not configured")
+            return None
+
+        body_dict = {
+            "coin": coin,
+            "chain": chain,
+            "address": address,
+            "amount": str(amount),
+            "timestamp": int(time.time() * 1000),
+        }
+        if tag:
+            body_dict["tag"] = tag
+
+        body_str = json.dumps(body_dict, separators=(",", ":"))
+        timestamp = self._now_ms()
+        recv_window = RECV_WINDOW
+        signature = self._sign(timestamp, recv_window, body_str)
+
+        headers = {
+            "X-BAPI-API-KEY": self.api_key,
+            "X-BAPI-SIGN": signature,
+            "X-BAPI-SIGN-TYPE": "2",
+            "X-BAPI-TIMESTAMP": timestamp,
+            "X-BAPI-RECV-WINDOW": recv_window,
+            "Content-Type": "application/json",
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{BASE_URL}/v5/asset/withdraw",
+                    headers=headers,
+                    data=body_str,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    data = await resp.json()
+
+            ret_code = data.get("retCode")
+            if ret_code == 0:
+                withdraw_id = data.get("result", {}).get("withdrawId")
+                logger.success(f"✅ Bybit withdrawal requested: {coin} {amount} to {address} | ID={withdraw_id}")
+                return withdraw_id
+            else:
+                logger.error(
+                    f"❌ Bybit withdrawal failed | retCode={ret_code} "
+                    f"retMsg={data.get('retMsg')} | coin={coin} amount={amount}"
+                )
+                return None
+        except Exception as e:
+            logger.error(f"❌ Bybit withdrawal exception: {e}")
+            return None
+
     async def close(self) -> None:
         """Cleanup resources."""
         # BybitTrader currently creates a new session per request,
