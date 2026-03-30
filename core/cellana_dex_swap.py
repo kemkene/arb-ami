@@ -122,10 +122,10 @@ class CellanaDexSwap:
         self.node_url = settings.aptos_node_url
         self.client = RestClient(self.node_url)
         
-        # Add API Key to headers if available
+        # Aptos Labs default nodes usually don't require API Key for basic REST
+        # If headers/default_headers are not supported by the SDK version, we skip it
         if settings.aptos_node_api_key:
-            self.client.client_config.headers["x-api-key"] = settings.aptos_node_api_key
-            logger.info("CellanaDexSwap: Aptos Node API Key configured.")
+            logger.info("CellanaDexSwap: Aptos Node API Key is set in .env but skipping header config due to SDK incompatibility.")
             
         self.max_gas = settings.aptos_max_gas
         self.default_slippage_pct = settings.dex_swap_slippage_pct

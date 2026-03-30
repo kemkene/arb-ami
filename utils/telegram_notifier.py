@@ -24,6 +24,12 @@ class TelegramNotifier:
         if not self.enabled:
             return
 
+        # Telegram limit is 4096 characters. Truncate to be safe.
+        max_len = 4000
+        if len(text) > max_len:
+            logger.warning(f"TelegramNotifier: Truncating message from {len(text)} to {max_len} characters")
+            text = text[:max_len] + "\n... (truncated)"
+
         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
         payload = {
             "chat_id": self.chat_id,
@@ -36,9 +42,9 @@ class TelegramNotifier:
                 async with session.post(url, json=payload, timeout=10) as response:
                     if response.status != 200:
                         resp_text = await response.text()
-                        logger.error(f"TelegramNotifier: Failed to send message (status {response.status}): {resp_text}")
+                        logger.error(f"TelegramNotifier: Failed to send message (status {response.status}, len {len(text)}): {resp_text}")
                     else:
-                        logger.debug("TelegramNotifier: Message sent successfully")
+                        logger.debug(f"TelegramNotifier: Message sent successfully (len {len(text)})")
         except Exception as e:
             logger.error(f"TelegramNotifier: Error sending message: {e}")
 

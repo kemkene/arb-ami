@@ -112,6 +112,10 @@ class BalanceManager:
     # ------------------------------------------------------------------ #
     #  Refresh
     # ------------------------------------------------------------------ #
+    async def refresh_all(self, force: bool = False) -> None:
+        """Alias for refresh() to maintain compatibility."""
+        await self.refresh()
+
     async def refresh(self, exchange: Optional[str] = None) -> None:
         """Fetch latest balances from specified exchange or all."""
         async with self._lock:
@@ -133,7 +137,10 @@ class BalanceManager:
             now = time.time()
             for coin, free_qty in raw.items():
                 self._cache["bybit"][coin] = AssetBalance(free=free_qty, timestamp=now)
-            logger.debug(f"BalanceManager: Bybit refreshed — {len(raw)} assets")
+            
+            apt = raw.get("APT", 0.0)
+            ami = raw.get("AMI", 0.0)
+            logger.debug(f"BalanceManager: Bybit refreshed | APT={apt:.2f} | AMI={ami:.0f}")
         except Exception as e:
             logger.error(f"BalanceManager: Bybit refresh failed: {e}")
 
@@ -144,7 +151,10 @@ class BalanceManager:
             now = time.time()
             for coin, free_qty in raw.items():
                 self._cache["mexc"][coin] = AssetBalance(free=free_qty, timestamp=now)
-            logger.debug(f"BalanceManager: MEXC refreshed — {len(raw)} assets")
+            
+            apt = raw.get("APT", 0.0)
+            ami = raw.get("AMI", 0.0)
+            logger.debug(f"BalanceManager: MEXC refreshed | APT={apt:.2f} | AMI={ami:.0f}")
         except Exception as e:
             logger.error(f"BalanceManager: MEXC refresh failed: {e}")
 
@@ -163,7 +173,7 @@ class BalanceManager:
             usdt_bal = await self._get_aptos_asset_balance(settings.usdt_token_address, 6)
             self._cache["dex"]["USDT"] = AssetBalance(free=usdt_bal, timestamp=now)
             
-            logger.debug(f"BalanceManager: Aptos refreshed — APT={apt_bal:.4f}, AMI={ami_bal:.2f}, USDT={usdt_bal:.2f}")
+            logger.debug(f"BalanceManager: Aptos refreshed | APT={apt_bal:.2f} | AMI={ami_bal:.0f} | USDT={usdt_bal:.2f}")
         except Exception as e:
             logger.error(f"BalanceManager: Aptos refresh failed: {e}")
 
@@ -211,6 +221,14 @@ class BalanceManager:
     # ------------------------------------------------------------------ #
     def get_free(self, exchange: str, asset: str) -> float:
         return self._cache.get(exchange.lower(), {}).get(asset.upper(), AssetBalance()).free
+
+    def get_all_balances(self, exchange: str) -> Dict[str, AssetBalance]:
+        """Return all asset balances for a specific exchange."""
+        return self._cache.get(exchange.lower(), {})
+
+    def get_total_usd_value(self, price_collector: Optional["PriceCollector"] = None) -> float:
+        """Alias for get_total_equity_usdt to maintain compatibility with TradeExecutor."""
+        return self.get_total_equity_usdt()
 
     def get_total_equity_usdt(self, current_prices: Optional[Dict[str, float]] = None) -> float:
         """

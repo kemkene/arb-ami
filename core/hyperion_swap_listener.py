@@ -48,50 +48,50 @@ class HyperionSwapListener:
         return [("authorization", f"Bearer {self.api_key}")]
 
     def _bootstrap_pool_state(self, silent: bool = False) -> Optional[Dict[str, Any]]:
-        """Fetch current pool state (sqrt_price, liquidity) via Aptos REST API."""
-        try:
-            if not silent:
-                logger.info("🔄 Bootstrapping initial pool state from Hyperion...")
-            
-            rest_api_url = "https://fullnode.mainnet.aptoslabs.com/v1"
-            
-            # Query pool state resource
-            pool_resource_type = f"{self.HYPERION_MODULE}::pool_v3::LiquidityPoolV3"
-            
-            response = requests.get(
-                f"{rest_api_url}/accounts/{self.HYPERION_POOL}/resource/{pool_resource_type}",
-                timeout=10
-            )
-            response.raise_for_status()
-            
-            resource_data = response.json().get("data", {})
-            sqrt_price = resource_data.get("sqrt_price")
-            liquidity = resource_data.get("liquidity")
-            
-            if sqrt_price and liquidity:
-                self.current_sqrt_price = int(sqrt_price)
-                self.current_liquidity = int(liquidity)
-                self.last_update_ts = time.time()
+        """Fetch current pool state (sqrt_price, liquidity) via Aptos REST API with rotation."""
+        import requests
+        if not silent:
+            logger.info("🔄 Bootstrapping Hyperion state (with RPC rotation)...")
+        
+        urls = settings.aptos_node_urls
+        for url in urls:
+            try:
+                # Query pool state resource
+                pool_resource_type = f"{self.HYPERION_MODULE}::pool_v3::LiquidityPoolV3"
+                full_url = f"{url}/accounts/{self.HYPERION_POOL}/resource/{pool_resource_type}"
                 
+                response = requests.get(full_url, timeout=5)
+                if response.status_code == 429:
+                    if not silent: logger.warning(f"⚠️ Node {url} rate limited (429)")
+                    continue
+                
+                response.raise_for_status()
+                resource_data = response.json().get("data", {})
+                sqrt_price = resource_data.get("sqrt_price")
+                liquidity = resource_data.get("liquidity")
+                
+                if sqrt_price and liquidity:
+                    self.current_sqrt_price = int(sqrt_price)
+                    self.current_liquidity = int(liquidity)
+                    self.last_update_ts = time.time()
+                    
+                    if not silent:
+                        logger.success(
+                            f"✅ [HYPERION BOOTSTRAP] Initialized (via {url})\n"
+                            f"   sqrt_price={self.current_sqrt_price}"
+                        )
+                    
+                    return {
+                        "type": "hyperion_bootstrap",
+                        "pool": self.HYPERION_POOL,
+                        "sqrt_price_x64": int(sqrt_price),
+                        "liquidity": int(liquidity),
+                        "source": "bootstrap"
+                    }
+            except Exception as e:
                 if not silent:
-                    logger.success(
-                        f"✅ [HYPERION BOOTSTRAP] AMI/APT Pool Initialized\n"
-                        f"   sqrt_price={self.current_sqrt_price}\n"
-                        f"   liquidity={self.current_liquidity}"
-                    )
-                
-                # Return payload
-                return {
-                    "type": "hyperion_bootstrap",
-                    "pool": self.HYPERION_POOL,
-                    "sqrt_price_x64": int(sqrt_price),
-                    "liquidity": int(liquidity),
-                    "source": "bootstrap"
-                }
-        except Exception as e:
-            if not silent:
-                logger.error(f"❌ Error bootstrapping Hyperion reserves: {e}")
-            return None
+                    logger.debug(f"Hyperion bootstrap failed for {url}: {e}")
+                continue
         return None
 
     async def run_reserve_poll_loop(self) -> None:

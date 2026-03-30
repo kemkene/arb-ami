@@ -76,9 +76,9 @@ class Settings:
         default_factory=lambda: float(os.getenv("ARB_CHECK_INTERVAL", "0.1"))
     )
 
-    # Minimum profit to log
+    # Profitability Thresholds (in USDT)
     min_profit_threshold: float = field(
-        default_factory=lambda: float(os.getenv("MIN_PROFIT_THRESHOLD", "1.0"))
+        default_factory=lambda: float(os.getenv("MIN_PROFIT_THRESHOLD", "0.5")) # Higher threshold to filter small noisy trades
     )
 
     # ── Enhanced Logging & Diagnostics ─────────────────────────────
@@ -110,16 +110,16 @@ class Settings:
 
     # Strategy-specific profit thresholds (percentage) — triggers if BOTH USD AND % met
     min_profit_pct_dex_to_cex: float = field(
-        default_factory=lambda: float(os.getenv("MIN_PROFIT_PCT_DEX_TO_CEX", "0.15"))
+        default_factory=lambda: float(os.getenv("MIN_PROFIT_PCT_DEX_TO_CEX", "0.05"))
     )
     min_profit_pct_ami_cycle: float = field(
-        default_factory=lambda: float(os.getenv("MIN_PROFIT_PCT_AMI_CYCLE", "0.15"))
+        default_factory=lambda: float(os.getenv("MIN_PROFIT_PCT_AMI_CYCLE", "0.05"))
     )
     min_profit_pct_cross_cex: float = field(
-        default_factory=lambda: float(os.getenv("MIN_PROFIT_PCT_CROSS_CEX", "0.15"))
+        default_factory=lambda: float(os.getenv("MIN_PROFIT_PCT_CROSS_CEX", "0.05"))
     )
     min_profit_pct_cex_to_cex: float = field(
-        default_factory=lambda: float(os.getenv("MIN_PROFIT_PCT_CEX_TO_CEX", "0.05"))
+        default_factory=lambda: float(os.getenv("MIN_PROFIT_PCT_CEX_TO_CEX", "0.02"))
     )
 
     # ── Telegram Notifications ─────────────────────────────────────
@@ -135,7 +135,7 @@ class Settings:
         default_factory=lambda: float(os.getenv("MIN_PROFIT_APT_START", "0.05"))
     )
     min_profit_pct_apt_start: float = field(
-        default_factory=lambda: float(os.getenv("MIN_PROFIT_PCT_APT_START", "0.15"))
+        default_factory=lambda: float(os.getenv("MIN_PROFIT_PCT_APT_START", "0.05"))
     )
 
     # AMI-start cycle thresholds (start with AMI, profit in AMI)
@@ -143,7 +143,7 @@ class Settings:
         default_factory=lambda: float(os.getenv("MIN_PROFIT_AMI_START", "0.05"))
     )
     min_profit_pct_ami_start: float = field(
-        default_factory=lambda: float(os.getenv("MIN_PROFIT_PCT_AMI_START", "0.15"))
+        default_factory=lambda: float(os.getenv("MIN_PROFIT_PCT_AMI_START", "0.05"))
     )
 
     # DEX-DEX cycle thresholds
@@ -172,7 +172,7 @@ class Settings:
     # Estimated on-chain gas cost per DEX swap (in USD)
     # Aptos typical swap gas: ~0.003-0.005 APT ≈ $0.003-$0.005
     gas_cost_usd: float = field(
-        default_factory=lambda: float(os.getenv("GAS_COST_USD", "0.005"))
+        default_factory=lambda: float(os.getenv("GAS_COST_USD", "0.05"))
     )
     # Aptos typical swap gas limit (units)
     swap_gas_limit: int = field(
@@ -183,6 +183,10 @@ class Settings:
     )
     hyperion_swap_gas_limit: int = field(
         default_factory=lambda: int(os.getenv("HYPERION_SWAP_GAS_LIMIT", "80000"))
+    )
+    # Estimated real gas usage for profit calculation (units)
+    estimated_gas_usage: int = field(
+        default_factory=lambda: int(os.getenv("ESTIMATED_GAS_USAGE", "18000"))
     )
     # Gas price polling interval
     gas_poll_interval_s: float = field(
@@ -345,6 +349,14 @@ class Settings:
             "APTOS_NODE_URL", "https://fullnode.mainnet.aptoslabs.com/v1"
         )
     )
+    aptos_node_urls: list[str] = field(
+        default_factory=lambda: [
+            u.strip() for u in os.getenv(
+                "APTOS_NODE_URLS", 
+                "https://fullnode.mainnet.aptoslabs.com/v1,https://aptos.nodereal.io/v1/public,https://mainnet.aptos-rpc.com"
+            ).split(",") if u.strip()
+        ]
+    )
     aptos_node_api_key: str = field(
         default_factory=lambda: os.getenv("APTOS_NODE_API_KEY") or os.getenv("CELLANA_GRPC_API_KEY", "")
     )
@@ -353,7 +365,7 @@ class Settings:
     )
     # Default on-chain slippage tolerance (%) for DEX swaps
     dex_swap_slippage_pct: float = field(
-        default_factory=lambda: float(os.getenv("DEX_SWAP_SLIPPAGE_PCT", "0.5"))
+        default_factory=lambda: float(os.getenv("DEX_SWAP_SLIPPAGE_PCT", "0.7"))
     )
     # DEX swap retry settings (CEX-first-then-DEX strategy)
     dex_swap_max_retries: int = field(
@@ -399,10 +411,43 @@ class Settings:
     rebalance_interval_min: float = field(
         default_factory=lambda: float(os.getenv("REBALANCE_INTERVAL_MIN", "30.0"))
     )
+    
+    # Dynamic Sizing (Optimize trade size based on actual balance)
+    use_dynamic_sizing: bool = field(
+        default_factory=lambda: os.getenv("USE_DYNAMIC_SIZING", "true").lower() == "true"
+    )
+    min_dynamic_trade_size_usdt: float = field(
+        default_factory=lambda: float(os.getenv("MIN_DYNAMIC_TRADE_SIZE_USDT", "5.0"))
+    ) # Minimum size to still consider a trade
+
+    stop_after_trade: bool = field(
+        default_factory=lambda: os.getenv("STOP_AFTER_TRADE", "false").lower() == "true"
+    )
+
     # Address to withdraw to (usually your Aptos wallet)
     aptos_address: str = field(
         default_factory=lambda: os.getenv("APTOS_WALLET_ADDRESS", "")
     )
+    
+    # Optional manual deposit address for Bybit (fallback if API returns empty)
+    bybit_deposit_address: str = field(
+        default_factory=lambda: os.getenv("BYBIT_DEPOSIT_ADDRESS", "")
+    )
+    
+    # Thresholds
+    min_apt_threshold: float = field(
+        default_factory=lambda: float(os.getenv("MIN_APT_THRESHOLD", "40.0"))
+    )
+    min_ami_threshold: float = field(
+        default_factory=lambda: float(os.getenv("MIN_AMI_THRESHOLD", "8000.0"))
+    )
+    min_usdt_threshold: float = field(
+        default_factory=lambda: float(os.getenv("MIN_USDT_THRESHOLD", "80.0"))
+    )
+
+    # Withdraw Networks (default to Aptos)
+    bybit_withdraw_chain: str = "APTOS"
+    mexc_withdraw_network: str = "APTOS(APT)"
 
 
 settings = Settings()

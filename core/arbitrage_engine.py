@@ -1,5 +1,6 @@
 import asyncio
 import time
+import traceback
 from dataclasses import dataclass
 from typing import Optional, Tuple, TYPE_CHECKING, Dict, List
 
@@ -10,6 +11,7 @@ from utils.telegram_notifier import notifier as tg_notifier
 from core.hyperion_math import decode_sqrt_price, calculate_amount_out
 
 from core.trade_executor import TradeExecutor, TradeLeg, LegSide
+import core.rebalance_manager
 
 logger = get_logger()
 
@@ -64,10 +66,12 @@ class ArbitrageEngine:
         cellana_listener: "Optional[CellanaSwapListener]" = None,
         hyperion_listener: "Optional[HyperionSwapListener]" = None,
         gas_monitor: "Optional[GasMonitor]" = None,
+        rebalancer: "Optional[core.rebalance_manager.RebalanceManager]" = None,
     ) -> None:
         self.collector = collector
         self.cex_symbol = cex_symbol or settings.cex_symbol
         self.trade_executor = trade_executor
+        self.rebalancer = rebalancer
         self.bybit_fee = settings.bybit_fee
         self.mexc_fee = settings.mexc_fee
         self.min_profit = settings.min_profit_threshold
@@ -112,18 +116,64 @@ class ArbitrageEngine:
         self._PRICE_LOG_INTERVAL_S = 5.0
         self._last_price_log: float = 0.0
 
-        # De-duplication
-        self.deduplicator = OpportunityDeduplicator(
-            cooldown_sec=settings.arb_dedup_cooldown_sec,
-            price_decimals=settings.arb_price_round_decimals,
-        )
-
         # Execution safety guards
         self._execution_lock = asyncio.Lock()
         self._trade_cooldown_s = settings.trade_cooldown_s
         self._last_trade_ts: float = 0.0
         self._is_running = True # Added for the while loop
         self.gas_cost_usd = settings.gas_cost_usd # Initial value, will be updated dynamically
+
+        # Deduplication
+        self.deduplicator = OpportunityDeduplicator(cooldown_sec=60.0)
+
+    def _calculate_max_affordable_size(self, exchange: str, asset: str, current_usdt: float) -> float:
+        """Calculate max USDT size we can afford based on current balance."""
+        ex_id = "dex" if exchange.lower() in ["dex", "cellana", "hyperion"] else exchange.lower()
+        
+        if not hasattr(self, 'balance_manager') or self.balance_manager is None:
+            if self.trade_executor and hasattr(self.trade_executor, 'balance_manager'):
+                self.balance_manager = self.trade_executor.balance_manager
+            else:
+                # If balance_manager is not available, we can't check balance, so assume full affordability
+                return current_usdt
+
+        free_bal = self.balance_manager.get_free(ex_id, asset.upper())
+        
+        # Security: If actual balance is 0, the size MUST be 0 regardless of settings
+        if free_bal <= 0:
+            logger.debug(f"⚖️ [Sizing] {ex_id}:{asset} balance is 0. Size capped to 0.0")
+            return 0.0
+
+        if not settings.use_dynamic_sizing:
+            return current_usdt
+
+        safe_bal = free_bal * 0.95
+        
+        # Get price to convert asset balance to USDT
+        price_ex = ex_id
+        if ex_id == "dex":
+            price_ex = "bybit" # Use Bybit as price reference for DEX assets
+        
+        p_data = self.collector.get_exchange(f"{asset.upper()}USDT", price_ex)
+        if not p_data and price_ex == "bybit":
+             # Fallback to MEXC if Bybit fails
+             p_data = self.collector.get_exchange(f"{asset.upper()}USDT", "mexc")
+             
+        price = p_data.bid if p_data else 0.0
+        if not price or price <= 0:
+            price = 1.0 if asset.upper() == "USDT" else 0.0
+            
+        affordable_usdt = safe_bal * price
+        final_size = min(current_usdt, affordable_usdt)
+        
+        if final_size < settings.min_dynamic_trade_size_usdt:
+            logger.debug(f"⚖️ [Sizing] {ex_id}:{asset} affordable ${final_size:.2f} < min ${settings.min_dynamic_trade_size_usdt}. Capping to 0.0")
+            return 0.0
+            
+        if final_size < current_usdt:
+            logger.debug(f"⚖️ [Sizing] {ex_id}:{asset} capped size: ${current_usdt:.2f} -> ${final_size:.2f} (bal={free_bal:.4f})")
+            
+        return final_size
 
     def update_cellana_state(self, payload: dict) -> None:
         """Receive latest Cellana SyncEvent state from listener callback."""
@@ -150,7 +200,7 @@ class ArbitrageEngine:
             self.collector.update_data_age("cellana", self.cex_symbol) # Standardize symbol for age tracking
 
             # Trigger immediate check (Reactive)
-            # Use create_task because this is called from a listener callback (potentially threaded)
+            logger.debug(f"⚡ [TRIGGER] Reactive check for Cellana v={version}")
             asyncio.create_task(self._trigger_dex_involved_checks())
         except (ValueError, TypeError):
             return
@@ -220,7 +270,7 @@ class ArbitrageEngine:
     ) -> None:
         """Centralized logic for de-duplication, logging and execution."""
         # 1. De-duplication
-        if not self.deduplicator.should_log(direction, buy_price, sell_price):
+        if not is_shadow and not self.deduplicator.should_log(direction, buy_price, sell_price):
             return
 
         # 2. Log
@@ -268,14 +318,7 @@ class ArbitrageEngine:
         # 3. Execution - HIGH PRIORITY
         if self.trade_executor and legs:
             logger.info(f"🚀 Executing {direction} (Steps: {len(trade_steps)})")
-            exec_coro = self.trade_executor.execute_multi_leg(
-                direction=direction,
-                legs=legs,
-                profit_est=profit_est,
-                trade_steps=trade_steps,
-                parallel=False,
-            )
-            asyncio.create_task(self._safe_execute(direction, exec_coro))
+            asyncio.create_task(self._safe_execute(direction, legs, profit_est, trade_steps))
 
         # 4. Logging & Notification (ASYNC)
         if log_steps and profit_est > self.min_profit:
@@ -315,7 +358,7 @@ class ArbitrageEngine:
         except Exception as e:
             logger.error(f"Error in _async_log_and_notify: {e}")
 
-    async def _safe_execute(self, direction: str, coro) -> None:
+    async def _safe_execute(self, direction: str, legs: list, profit_est: float, trade_steps: list) -> None:
         """Wrapper to enforce lock and cooldown per trade."""
         if self._execution_lock.locked():
             logger.debug(f"⏭️ Lock busy — skipping execution for {direction}")
@@ -334,7 +377,26 @@ class ArbitrageEngine:
 
             self._last_trade_ts = now
             try:
-                await coro
+                # Create the coroutine ONLY after we have the lock
+                res = await self.trade_executor.execute_multi_leg(
+                    direction=direction,
+                    legs=legs,
+                    profit_est=profit_est,
+                    trade_steps=trade_steps,
+                    parallel=False,
+                )
+                
+                # Check for rebalance immediately after trade
+                if res and res.ok and self.rebalancer:
+                    # Run in background to not block the engine lock
+                    asyncio.create_task(self.rebalancer.check_and_rebalance(force=True))
+                
+                if settings.stop_after_trade:
+                    logger.info("🛑 [ONCE_MODE] Successful trade completed. Stopping bot as requested.")
+                    # Give time for async logging/TG notify tasks
+                    await asyncio.sleep(2)
+                    import os
+                    os._exit(0)
             except Exception as e:
                 logger.error(f"Trade execution task failed for {direction}: {e}")
 
@@ -390,7 +452,7 @@ class ArbitrageEngine:
             opp_ca = self._check_circular_arbitrage_ami("Bybit", bybit, bybit_apt, self.bybit_fee)
             if opp_ca: opportunities.append(opp_ca)
             
-            opps_h = self._check_hyperion_dex_cex("Bybit", bybit, bybit_apt, self.bybit_fee)
+            opps_h = self._check_dex_cex_for_hyperion("Bybit", bybit, bybit_apt, self.bybit_fee)
             if opps_h: opportunities.extend(opps_h)
 
         # 3. DEX-CEX (MEXC)
@@ -401,7 +463,7 @@ class ArbitrageEngine:
             opp_ca_m = self._check_circular_arbitrage_ami("MEXC", mexc, mexc_apt, self.mexc_fee)
             if opp_ca_m: opportunities.append(opp_ca_m)
             
-            opps_h_m = self._check_hyperion_dex_cex("MEXC", mexc, mexc_apt, self.mexc_fee)
+            opps_h_m = self._check_dex_cex_for_hyperion("MEXC", mexc, mexc_apt, self.mexc_fee)
             if opps_h_m: opportunities.extend(opps_h_m)
 
         # 4. Cross-CEX routes
@@ -420,33 +482,40 @@ class ArbitrageEngine:
 
     async def _trigger_dex_involved_checks(self) -> None:
         """Trigger arbitrage checks that involve DEX prices immediately after a DEX update."""
-        cex_prices = self.collector.get(self.cex_symbol)
-        bybit = cex_prices.get("bybit")
-        mexc = cex_prices.get("mexc")
+        try:
+            cex_prices = self.collector.get(self.cex_symbol)
+            bybit = cex_prices.get("bybit")
+            mexc = cex_prices.get("mexc")
 
-        apt_prices = self.collector.get(self.apt_cex_symbol)
-        bybit_apt = apt_prices.get("bybit")
-        mexc_apt = apt_prices.get("mexc")
+            apt_prices = self.collector.get(self.apt_cex_symbol)
+            bybit_apt = apt_prices.get("bybit")
+            mexc_apt = apt_prices.get("mexc")
 
-        opportunities = self._check_all_routes(bybit, mexc, bybit_apt, mexc_apt)
-        
-        if not opportunities:
-            return
+            opportunities = self._check_all_routes(bybit, mexc, bybit_apt, mexc_apt)
+            
+            if not opportunities:
+                logger.debug("🔍 [EVAL] No profitable routes found for this update.")
+                return
 
-        # 1. Identity feasible opportunities (those we have enough balance for)
-        feasible_opps: List[Tuple[Opportunity, dict]] = []
-        for opp in opportunities:
-            if self.trade_executor:
-                # We use a helper to check if we HAVE the assets needed for this specific opp
-                ok, details = await self.trade_executor._check_balances(opp.legs, opp.direction)
-                if ok:
-                    feasible_opps.append((opp, details))
-                else:
-                    # Log as shadow immediately if not feasible due to balance
-                    self._log_and_execute(
-                        opp.direction, opp.buy_price, opp.sell_price,
-                        opp.log_msg, is_shadow=True, skip_reason=f"Insufficient Balance"
-                    )
+            logger.info(f"🔍 [EVAL] Found {len(opportunities)} potential routes to evaluate")
+
+            # 1. Identity feasible opportunities (those we have enough balance for)
+            feasible_opps: List[Tuple[Opportunity, dict]] = []
+            for opp in opportunities:
+                if self.trade_executor:
+                    # We use a helper to check if we HAVE the assets needed for this specific opp
+                    ok, details = await self.trade_executor._check_balances(opp.legs, opp.direction)
+                    if ok:
+                        feasible_opps.append((opp, details))
+                    else:
+                        # Log as shadow immediately if not feasible due to balance
+                        self._log_and_execute(
+                            opp.direction, opp.buy_price, opp.sell_price,
+                            opp.log_msg, is_shadow=True, skip_reason=f"Insufficient Balance"
+                        )
+        except Exception as e:
+            logger.error(f"❌ Error in _trigger_dex_involved_checks: {e}")
+            logger.error(traceback.format_exc())
 
         if not feasible_opps:
             # If no opportunities are feasible, we might still want to log the best one as shadow if it was excluded only by balance
@@ -499,7 +568,10 @@ class ArbitrageEngine:
             return None
 
         # Direction 1: Buy Bybit ask -> Sell MEXC bid
-        qty = min(bybit.ask_qty, mexc.bid_qty)
+        # Limit qty by budget to avoid "Max Qty" errors and over-exposure
+        max_qty_budget = settings.trade_amount_usdt / bybit.ask if bybit.ask > 0 else 0
+        qty = min(bybit.ask_qty, mexc.bid_qty, max_qty_budget)
+        
         if qty > 0:
             bv, sv, profit = self._calc_profit(
                 bybit.ask, mexc.bid, qty, self.bybit_fee, self.mexc_fee
@@ -517,7 +589,9 @@ class ArbitrageEngine:
                 return Opportunity(direction, profit, legs, bybit.ask, mexc.bid, log_msg)
 
         # Direction 2: Buy MEXC ask -> Sell Bybit bid
-        qty = min(mexc.ask_qty, bybit.bid_qty)
+        max_qty_budget2 = settings.trade_amount_usdt / mexc.ask if mexc.ask > 0 else 0
+        qty = min(mexc.ask_qty, bybit.bid_qty, max_qty_budget2)
+        
         if qty > 0:
             bv, sv, profit = self._calc_profit(
                 mexc.ask, bybit.bid, qty, self.mexc_fee, self.bybit_fee
@@ -558,12 +632,19 @@ class ArbitrageEngine:
 
         apt_mid = apt_quote.mid
         if apt_mid <= 0:
+            logger.debug(f"[{exchange_name}] Skip: APT mid <= 0")
             return None
+
+        # DETAILED LOGGING FOR DEBUGGING
+        logger.debug(
+            f"🔍 [DEBUG EVAL] {exchange_name} | DEX Spot: {self.cellana_last_spot:.8f} | "
+            f"AMI {exchange_name}: {ami_quote.bid}/{ami_quote.ask} (age: {ami_quote.age:.1f}s) | "
+            f"APT {exchange_name}: {apt_quote.bid}/{apt_quote.ask} (age: {apt_quote.age:.1f}s)"
+        )
 
         r_ami = self.cellana_reserves_ami
         r_apt = self.cellana_reserves_apt
             
-        # FAST PATH: Check with baseline size first
         # Optimization: Don't call _find_optimal_size if baseline isn't profitable
         baseline_profit = self._eval_profit(settings.trade_amount_usdt, "DEX_CEX_APT_CYCLE", 
                                           apt_mid=apt_mid, r_apt=r_apt, r_ami=r_ami,
@@ -575,9 +656,15 @@ class ArbitrageEngine:
         # Optimization: Find optimal size
         opt_size_usdt = self._find_optimal_size(
             "DEX_CEX_APT_CYCLE",
+            ex_id=exchange_name.lower(),
             apt_mid=apt_mid, r_apt=r_apt, r_ami=r_ami,
             ami_bid=ami_quote.bid, apt_ask=apt_quote.ask, cex_fee=cex_fee
         )
+        # Cap by available balance (DEX APT)
+        opt_size_usdt = self._calculate_max_affordable_size("dex", "APT", opt_size_usdt)
+        if opt_size_usdt <= 0:
+            return None
+            
         apt_start = opt_size_usdt / apt_mid
         
         # Step 1: Swap APT → AMI on Cellana DEX
@@ -699,8 +786,10 @@ class ArbitrageEngine:
             return None
             
         # gRPC-aware staleness
-        grpc_active = self.cellana_listener and self.cellana_listener.is_grpc_active
-        if not grpc_active and (time.time() - self.cellana_last_update_ts > 40.0):
+        cellana_grpc = False
+        if self.cellana_listener:
+            cellana_grpc = self.cellana_listener.is_grpc_active
+        if not cellana_grpc and (time.time() - self.cellana_last_update_ts > 40.0):
             return None
 
         ami_mid = ami_quote.mid
@@ -723,6 +812,11 @@ class ArbitrageEngine:
             ami_mid=ami_mid, r_apt=r_apt, r_ami=r_ami,
             ami_bid=ami_quote.bid, apt_ask=apt_quote.ask, cex_fee=cex_fee
         )
+        # Cap by balance (CEX AMI)
+        opt_size_usdt = self._calculate_max_affordable_size(exchange_name, "AMI", opt_size_usdt)
+        if opt_size_usdt <= 0:
+            return None
+            
         ami_start = opt_size_usdt / ami_mid
 
         # Step 1: Sell AMI on CEX for USDT
@@ -784,7 +878,7 @@ class ArbitrageEngine:
         
         return None
 
-    def _check_hyperion_dex_cex(
+    def _check_dex_cex_for_hyperion(
         self,
         exchange_name: str,
         ami_quote: PriceData,
@@ -793,9 +887,10 @@ class ArbitrageEngine:
     ) -> List[Opportunity]:
         """Check arbitrage between Hyperion (CLMM) and CEX."""
         results = []
-        if ami_quote.is_stale(5.0) or apt_quote.is_stale(5.0):
-            return []
         if self.hyperion_sqrt_price_x64 is None or self.hyperion_liquidity is None:
+            return []
+            
+        if ami_quote.is_stale(5.0) or apt_quote.is_stale(5.0):
             return []
             
         # gRPC-aware staleness
@@ -804,163 +899,110 @@ class ArbitrageEngine:
             return []
 
         apt_mid = apt_quote.mid
-        if apt_mid <= 0:
-            return []
+        h_sqrt_p = self.hyperion_sqrt_price_x64
+        h_liq = self.hyperion_liquidity
 
         # ------------------------------------------------------------------ #
         # Direction A: Circular APT (APT -> AMI (Hyperion) -> USDT (CEX) -> APT (CEX))
         # ------------------------------------------------------------------ #
-        h_sqrt_p = self.hyperion_sqrt_price_x64
-        h_liq = self.hyperion_liquidity
-
-        # FAST PATH: Check with baseline size first
-        # Optimization: Don't call _find_optimal_size if baseline isn't profitable
-        baseline_profit = self._eval_profit(settings.trade_amount_usdt, "HYPERION_APT_CYCLE", 
-                                          apt_mid=apt_mid, h_sqrt_p=h_sqrt_p, h_liq=h_liq,
-                                          ami_bid=ami_quote.bid, apt_ask=apt_quote.ask, cex_fee=cex_fee)
+        # Dynamic sizing based on DEX APT balance
+        current_size_usdt = self._calculate_max_affordable_size("dex", "APT", settings.trade_amount_usdt)
         
-        if baseline_profit <= 0:
-            ami_out = 0 # Skip calculation
-        else:
-            # Optimization: Find optimal size
-            opt_size_usdt = self._find_optimal_size(
-                "HYPERION_APT_CYCLE",
-                apt_mid=apt_mid, h_sqrt_p=h_sqrt_p, h_liq=h_liq,
-                ami_bid=ami_quote.bid, apt_ask=apt_quote.ask, cex_fee=cex_fee
-            )
-            apt_start = opt_size_usdt / apt_mid
+        if current_size_usdt >= settings.min_dynamic_trade_size_usdt:
+            # FAST PATH: Check with dynamic size first
+            baseline_profit = self._eval_profit(current_size_usdt, "HYPERION_APT_CYCLE", 
+                                              apt_mid=apt_mid, h_sqrt_p=h_sqrt_p, h_liq=h_liq,
+                                              ami_bid=ami_quote.bid, apt_ask=apt_quote.ask, cex_fee=cex_fee)
             
-            ami_out, impact = calculate_amount_out(
-                h_sqrt_p,
-                h_liq,
-                apt_start,
-                fee_rate=self.hyperion_fee,
-                is_token0_to_token1=True
-            )
-        
-        if ami_out > 0:
-            # Step 2: Sell AMI on CEX for USDT
-            usdt_from_ami = ami_out * ami_quote.bid * (1.0 - cex_fee)
-            # Step 3: Buy APT back on CEX with USDT
-            apt_end = (usdt_from_ami / apt_quote.ask) * (1.0 - cex_fee)
-            
-            profit_apt = apt_end - apt_start
-            profit_usdt = profit_apt * apt_mid
-            if profit_usdt > self.min_profit:
-                direction = f"HYPERION_APT_CYCLE_{exchange_name.upper()}"
-                log_msg = (
-                    f"💎 [Hyperion Circular APT] {direction} | Profit: ${profit_usdt:.4f} | "
-                    f"Buy Hyperion AMI (with APT) -> Sell {exchange_name} AMI | Qty: {ami_out:.2f}"
+            if baseline_profit > 0:
+                # Optimization: Find optimal size
+                opt_size_usdt = self._find_optimal_size(
+                    "HYPERION_APT_CYCLE",
+                    ex_id=exchange_name.lower(),
+                    apt_mid=apt_mid, h_sqrt_p=h_sqrt_p, h_liq=h_liq,
+                    ami_bid=ami_quote.bid, apt_ask=apt_quote.ask, cex_fee=cex_fee
                 )
+                # Cap by balance again (just in case)
+                opt_size_usdt = self._calculate_max_affordable_size("dex", "APT", opt_size_usdt)
                 
-                legs = [
-                    TradeLeg(
-                        exchange="hyperion",
-                        symbol="APT_AMI",
-                        side=LegSide.BUY,
-                        qty=apt_start,
-                        price_est=ami_out / apt_start,
-                        tag="hyp_apt_to_ami",
-                        is_dex=True,
-                        dex_direction="apt_to_ami",
-                    ),
-                    TradeLeg(
-                        exchange=exchange_name.lower(),
-                        symbol=settings.cex_symbol,
-                        side=LegSide.SELL,
-                        qty=ami_out,
-                        price_est=ami_quote.bid,
-                        tag=f"cex_sell_ami_{exchange_name}",
-                    ),
-                    TradeLeg(
-                        exchange=exchange_name.lower(),
-                        symbol=settings.apt_cex_symbol,
-                        side=LegSide.BUY,
-                        qty=apt_end,
-                        price_est=apt_quote.ask,
-                        tag=f"cex_buy_apt_{exchange_name}",
-                    ),
-                ]
-                results.append(Opportunity(direction, profit_usdt, legs, float(ami_out / apt_start), float(ami_quote.bid), log_msg))
+                if opt_size_usdt >= settings.min_dynamic_trade_size_usdt:
+                    apt_start = opt_size_usdt / apt_mid
+                    ami_out, impact = calculate_amount_out(
+                        h_sqrt_p, h_liq, apt_start, self.hyperion_fee, is_token0_to_token1=True
+                    )
+                    
+                    if ami_out > 0:
+                        usdt_from_ami = ami_out * ami_quote.bid * (1.0 - cex_fee)
+                        apt_end = (usdt_from_ami / apt_quote.ask) * (1.0 - cex_fee)
+                        profit_apt = apt_end - apt_start
+                        profit_usdt = profit_apt * apt_mid
+                        
+                        if profit_usdt > self.min_profit:
+                            direction = f"HYPERION_APT_CYCLE_{exchange_name.upper()}"
+                            log_msg = (
+                                f"💎 [Hyperion Circular APT] {direction} | Profit: ${profit_usdt:.4f} | "
+                                f"Buy Hyperion AMI (with APT) -> Sell {exchange_name} AMI | Qty: {ami_out:.2f}"
+                            )
+                            
+                            legs = [
+                                TradeLeg(exchange="hyperion", symbol="APT_AMI", side=LegSide.BUY, qty=apt_start, 
+                                         price_est=ami_out / apt_start, tag="hyp_apt_to_ami", is_dex=True, dex_direction="apt_to_ami"),
+                                TradeLeg(exchange=exchange_name.lower(), symbol=settings.cex_symbol, side=LegSide.SELL, qty=ami_out, 
+                                         price_est=ami_quote.bid, tag=f"cex_sell_ami_{exchange_name}"),
+                                TradeLeg(exchange=exchange_name.lower(), symbol=settings.apt_cex_symbol, side=LegSide.BUY, qty=apt_end, 
+                                         price_est=apt_quote.ask, tag=f"cex_buy_apt_{exchange_name}"),
+                            ]
+                            results.append(Opportunity(direction, profit_usdt, legs, float(ami_out / apt_start), float(ami_quote.bid), log_msg))
 
         # ------------------------------------------------------------------ #
         # Direction B: Circular AMI (AMI -> APT (Hyperion) -> USDT (CEX) -> AMI (CEX))
         # ------------------------------------------------------------------ #
         ami_mid = ami_quote.mid
-        if ami_mid <= 0:
-            return results
-            
-        # FAST PATH: Check with baseline size (100 USDT) first
-        # Optimization: Don't call _find_optimal_size if baseline isn't profitable
-        baseline_profit_b = self._eval_profit(100.0, "HYPERION_AMI_CYCLE", 
-                                            ami_mid=ami_mid, h_sqrt_p=h_sqrt_p, h_liq=h_liq,
-                                            ami_bid=ami_quote.bid, apt_ask=apt_quote.ask, cex_fee=cex_fee)
+        # Dynamic sizing based on CEX AMI balance
+        current_size_usdt_b = self._calculate_max_affordable_size(exchange_name, "AMI", settings.trade_amount_usdt)
         
-        if baseline_profit_b <= 0:
-            apt_out = 0 # Skip
-        else:
-            # Optimization: Find optimal size
-            opt_size_usdt_b = self._find_optimal_size(
-                "HYPERION_AMI_CYCLE",
-                ami_mid=ami_mid, h_sqrt_p=h_sqrt_p, h_liq=h_liq,
-                ami_bid=ami_quote.bid, apt_ask=apt_quote.ask, cex_fee=cex_fee
-            )
-            ami_start = opt_size_usdt_b / ami_mid
+        if ami_mid > 0 and current_size_usdt_b >= settings.min_dynamic_trade_size_usdt:
+            baseline_profit_b = self._eval_profit(current_size_usdt_b, "HYPERION_AMI_CYCLE", 
+                                                ami_mid=ami_mid, h_sqrt_p=h_sqrt_p, h_liq=h_liq,
+                                                ami_bid=ami_quote.bid, apt_ask=apt_quote.ask, cex_fee=cex_fee)
             
-            # Swap AMI -> APT means token1 -> token0 (is_token0_to_token1=False)
-            apt_out, impact_b = calculate_amount_out(
-                h_sqrt_p,
-                h_liq,
-                ami_start,
-                fee_rate=self.hyperion_fee,
-                is_token0_to_token1=False
-            )
-        
-        if apt_out > 0:
-            # Step 2: Sell APT on CEX for USDT
-            usdt_from_apt = apt_out * apt_quote.bid * (1.0 - cex_fee)
-            # Step 3: Buy AMI back on CEX with USDT
-            ami_end = (usdt_from_apt / ami_quote.ask) * (1.0 - cex_fee)
-            
-            profit_ami = ami_end - ami_start
-            profit_usdt_b = profit_ami * ami_mid
-            
-            if profit_usdt_b > self.min_profit:
-                direction = f"HYPERION_AMI_CYCLE_{exchange_name.upper()}"
-                log_msg = (
-                    f"💎 [Hyperion Circular AMI] {direction} | Profit: ${profit_usdt_b:.4f} | "
-                    f"Sell {exchange_name} AMI -> Buy APT on CEX -> Buy Hyperion AMI | Qty: {ami_start:.2f}"
+            if baseline_profit_b > 0:
+                opt_size_usdt_b = self._find_optimal_size(
+                    "HYPERION_AMI_CYCLE",
+                    ex_id=exchange_name.lower(),
+                    ami_mid=ami_mid, h_sqrt_p=h_sqrt_p, h_liq=h_liq,
+                    apt_bid=apt_quote.bid, ami_ask=ami_quote.ask, cex_fee=cex_fee
                 )
+                opt_size_usdt_b = self._calculate_max_affordable_size(exchange_name, "AMI", opt_size_usdt_b)
+                
+                if opt_size_usdt_b >= settings.min_dynamic_trade_size_usdt:
+                    ami_start = opt_size_usdt_b / ami_mid
+                    apt_out, impact_b = calculate_amount_out(
+                        h_sqrt_p, h_liq, ami_start, self.hyperion_fee, is_token0_to_token1=False
+                    )
+                    
+                    if apt_out > 0:
+                        usdt_from_apt = apt_out * apt_quote.bid * (1.0 - cex_fee)
+                        ami_end = (usdt_from_apt / ami_quote.ask) * (1.0 - cex_fee)
+                        profit_ami = ami_end - ami_start
+                        profit_usdt_b = profit_ami * ami_mid
+                        
+                        if profit_usdt_b > self.min_profit:
+                            direction = f"HYPERION_AMI_CYCLE_{exchange_name.upper()}"
+                            log_msg = (
+                                f"💎 [Hyperion Circular AMI] {direction} | Profit: ${profit_usdt_b:.4f} | "
+                                f"Sell {exchange_name} AMI -> Buy APT on CEX -> Buy Hyperion AMI | Qty: {ami_start:.2f}"
+                            )
 
-                legs_b = [
-                    TradeLeg(
-                        exchange="hyperion",
-                        symbol="AMI_APT",
-                        side=LegSide.BUY,
-                        qty=ami_start,
-                        price_est=apt_out / ami_start,
-                        tag="hyp_ami_to_apt",
-                        is_dex=True,
-                        dex_direction="ami_to_apt",
-                    ),
-                    TradeLeg(
-                        exchange=exchange_name.lower(),
-                        symbol=settings.apt_cex_symbol,
-                        side=LegSide.SELL,
-                        qty=apt_out,
-                        price_est=apt_quote.bid,
-                        tag=f"cex_sell_apt_{exchange_name}",
-                    ),
-                    TradeLeg(
-                        exchange=exchange_name.lower(),
-                        symbol=settings.cex_symbol,
-                        side=LegSide.BUY,
-                        qty=ami_end,
-                        price_est=ami_quote.ask,
-                        tag=f"cex_buy_ami_{exchange_name}",
-                    ),
-                ]
-                results.append(Opportunity(direction, profit_usdt_b, legs_b, float(apt_out / ami_start), float(apt_quote.bid), log_msg))
+                            legs_b = [
+                                TradeLeg(exchange="hyperion", symbol="AMI_APT", side=LegSide.BUY, qty=ami_start, 
+                                         price_est=apt_out / ami_start, tag="hyp_ami_to_apt", is_dex=True, dex_direction="ami_to_apt"),
+                                TradeLeg(exchange=exchange_name.lower(), symbol=settings.apt_cex_symbol, side=LegSide.SELL, qty=apt_out, 
+                                         price_est=apt_quote.bid, tag=f"cex_sell_apt_{exchange_name}"),
+                                TradeLeg(exchange=exchange_name.lower(), symbol=settings.cex_symbol, side=LegSide.BUY, qty=ami_end, 
+                                         price_est=ami_quote.ask, tag=f"cex_buy_ami_{exchange_name}"),
+                            ]
+                            results.append(Opportunity(direction, profit_usdt_b, legs_b, float(apt_out / ami_start), float(apt_quote.bid), log_msg))
 
         return results
 
@@ -972,7 +1014,6 @@ class ArbitrageEngine:
         if apt_mid <= 0:
             return []
             
-        # Check Cellana freshness (gRPC-aware)
         cellana_grpc = self.cellana_listener and self.cellana_listener.is_grpc_active
         if (self.cellana_reserves_ami is None or self.cellana_reserves_apt is None or 
             (not cellana_grpc and time.time() - self.cellana_last_update_ts > 40.0)):
@@ -1006,7 +1047,13 @@ class ArbitrageEngine:
                 "DEX_DEX_CELLANA_HYPERION", 
                 apt_mid=apt_mid, r_apt=r_apt, r_ami=r_ami, h_sqrt_p=h_sqrt_p, h_liq=h_liq
             )
-            apt_start = opt_size_usdt / apt_mid
+            # Cap by balance (DEX APT)
+            opt_size_usdt = self._calculate_max_affordable_size("dex", "APT", opt_size_usdt)
+            if opt_size_usdt <= 0:
+                apt_start = 0
+                ami_mid_out = 0
+            else:
+                apt_start = opt_size_usdt / apt_mid
             
             # We know r_apt, r_ami, h_sqrt_p, h_liq are not None here
             ami_mid_out = self._amm_out(apt_start, int(r_apt), int(r_ami), self.cellana_fee)
@@ -1070,7 +1117,13 @@ class ArbitrageEngine:
                 "DEX_DEX_HYPERION_CELLANA",
                 apt_mid=apt_mid, r_apt=r_apt, r_ami=r_ami, h_sqrt_p=h_sqrt_p, h_liq=h_liq
             )
-            apt_start2 = opt_size_usdt2 / apt_mid
+            # Cap by balance (DEX APT)
+            opt_size_usdt2 = self._calculate_max_affordable_size("dex", "APT", opt_size_usdt2)
+            if opt_size_usdt2 <= 0:
+                apt_start2 = 0
+                ami_hyp_out = 0
+            else:
+                apt_start2 = opt_size_usdt2 / apt_mid
             ami_hyp_out, impact2 = calculate_amount_out(
                 int(h_sqrt_p), int(h_liq), apt_start2, self.hyperion_fee, is_token0_to_token1=True
             )
@@ -1176,19 +1229,24 @@ class ArbitrageEngine:
                     f"Gas: ${self.gas_cost_usd:.4f}"
                 )
 
-            # Use tournament logic in main loop
-            opportunities = self._check_all_routes(bybit, mexc, bybit_apt, mexc_apt)
-            if opportunities:
-                best_opp = max(opportunities, key=lambda x: x.profit_usdt)
-                if best_opp.profit_usdt > self.min_profit:
-                    self._log_and_execute(
-                        best_opp.direction,
-                        best_opp.buy_price,
-                        best_opp.sell_price,
-                        best_opp.log_msg,
-                        best_opp.legs,
-                        best_opp.profit_usdt
-                    )
+            # ── Tournament & Execution ───────────────────────────────────────
+            # OPTIMIZATION: If we are already executing, skip the heavy math/checks
+            if self._execution_lock.locked():
+                # Still log prices but skip arb calculation
+                pass
+            else:
+                opportunities = self._check_all_routes(bybit, mexc, bybit_apt, mexc_apt)
+                if opportunities:
+                    best_opp = max(opportunities, key=lambda x: x.profit_usdt)
+                    if best_opp.profit_usdt > self.min_profit:
+                        self._log_and_execute(
+                            best_opp.direction,
+                            best_opp.buy_price,
+                            best_opp.sell_price,
+                            best_opp.log_msg,
+                            best_opp.legs,
+                            best_opp.profit_usdt
+                        )
                 else:
                     # Optional: Log as trace or ignore if negative
                     pass
@@ -1221,7 +1279,12 @@ class ArbitrageEngine:
                     break
             
         # cost = (units * unit_price / 1e8) * apt_usd_price
-        target_limit = gas_limit if gas_limit is not None else settings.swap_gas_limit
+        # Priority: explicit gas_limit > estimated_gas_usage > swap_gas_limit
+        if gas_limit is not None:
+            target_limit = gas_limit
+        else:
+            target_limit = settings.estimated_gas_usage if hasattr(settings, 'estimated_gas_usage') else settings.swap_gas_limit
+            
         cost_usd = (target_limit * gas_unit_price / 1e8) * apt_price
         return float(cost_usd)
 
@@ -1234,28 +1297,15 @@ class ArbitrageEngine:
         if not self.optimal_size_enabled:
             return settings.trade_amount_usdt
 
+        # 1. Determine the maximum possible size based on real wallet/exchange balance
+        max_balance_usdt = self._get_max_balance_for_route(route_type, **kwargs)
+        
         low = self.min_trade_usdt
-        high = self.max_trade_usdt
+        high = min(self.max_trade_usdt, max_balance_usdt)
+        
+        if high <= low:
+            return low if max_balance_usdt >= low else 0.0
 
-        # Cap by actual wallet balance (if BalanceManager is available) - DISABLED if virtual_sizing_enabled
-        if not settings.virtual_sizing_enabled and self.trade_executor and self.trade_executor.balance_manager:
-            # Refresh balances to get fresh data
-            asyncio.create_task(self.trade_executor.balance_manager.refresh_all())
-            
-            avail_usdt = self.trade_executor.balance_manager.get_total_available_usdt()
-            if avail_usdt > 0:
-                # Leave 2-3% buffer for fees/slippage/gas
-                safety_buffer = 0.98 
-                balance_cap = avail_usdt * safety_buffer
-                
-                # If we are doing a CIRCULAR_APT route, we might also be capped by APT balance
-                # but USDT is a good universal proxy for "available capital" in this bot's search
-                high = min(high, balance_cap)
-                
-                if high < low:
-                    return low # Not enough balance for even minimum trade
-        
-        
         # Golden-section search iterations
         for _ in range(self.optimal_size_steps):
             d = self._phi * (high - low)
@@ -1269,11 +1319,91 @@ class ArbitrageEngine:
                 low = x2
             else:
                 high = x1
-                
-        optimal = (low + high) / 2
         
-        # Safety: don't let it go below min_trade_usdt
+        optimal = (low + high) / 2
         return max(self.min_trade_usdt, optimal)
+
+    def _get_max_balance_for_route(self, route_type: str, **kwargs) -> float:
+        """Helper to find the maximum USDT-equivalent we can trade based on current balances."""
+        if not self.trade_executor or not self.trade_executor.balance_manager:
+            return settings.trade_amount_usdt
+
+        bm = self.trade_executor.balance_manager
+        ex_id = kwargs.get("ex_id")
+        
+        try:
+            if route_type == "DEX_DEX_CELLANA_HYPERION":
+                # Need APT on Dex
+                apt_bal = bm.get_free("dex", "APT")
+                apt_price = kwargs.get("apt_mid", 10.0)
+                # Reserve 0.1 APT for gas
+                return max(0.0, (apt_bal - 0.1) * apt_price)
+            
+            elif route_type == "DEX_DEX_HYPERION_CELLANA":
+                # Need APT on Dex
+                apt_bal = bm.get_free("dex", "APT")
+                apt_price = kwargs.get("apt_mid", 10.0)
+                return max(0.0, (apt_bal - 0.1) * apt_price)
+                
+            elif route_type == "DEX_CEX_APT_CYCLE":
+                # Circular APT: DEX(APT->AMI) + CEX(AMI->USDT)
+                # 1. Check APT on DEX
+                apt_bal_dex = bm.get_free("dex", "APT")
+                apt_price = kwargs.get("apt_mid", 10.0)
+                size_from_dex = max(0.0, (apt_bal_dex - 0.1) * apt_price)
+                
+                # 2. Check AMI on CEX (if ex_id provided)
+                if ex_id:
+                    ami_bal_cex = bm.get_free(ex_id, "AMI")
+                    ami_price = kwargs.get("ami_bid", 0.007)
+                    size_from_cex = ami_bal_cex * ami_price
+                    return min(size_from_dex, size_from_cex)
+                return size_from_dex
+
+            elif route_type == "HYPERION_APT_CYCLE":
+                # Same as DEX_CEX_APT_CYCLE
+                apt_bal_dex = bm.get_free("dex", "APT")
+                apt_price = kwargs.get("apt_mid", 10.0)
+                size_from_dex = max(0.0, (apt_bal_dex - 0.1) * apt_price)
+                if ex_id:
+                    ami_bal_cex = bm.get_free(ex_id, "AMI")
+                    ami_price = kwargs.get("ami_bid", 0.007)
+                    size_from_cex = ami_bal_cex * ami_price
+                    return min(size_from_dex, size_from_cex)
+                return size_from_dex
+
+            elif route_type == "HYPERION_AMI_CYCLE":
+                # Circular AMI: DEX(AMI->APT) + CEX(APT->USDT)
+                # 1. Check AMI on DEX
+                ami_bal_dex = bm.get_free("dex", "AMI")
+                ami_price = kwargs.get("ami_mid", 0.007)
+                size_from_dex = ami_bal_dex * ami_price
+                # 2. Check APT on CEX
+                if ex_id:
+                    apt_bal_cex = bm.get_free(ex_id, "APT")
+                    apt_price = kwargs.get("apt_bid", 10.0)
+                    size_from_cex = max(0.0, (apt_bal_cex - 1.0) * apt_price) # Reserve 1 APT for gas
+                    return min(size_from_dex, size_from_cex)
+                return size_from_dex
+
+            elif route_type == "CROSS_CEX_CIRCULAR_APT":
+                # Need APT on Source CEX
+                if ex_id:
+                    apt_bal = bm.get_free(ex_id, "APT")
+                    apt_price = kwargs.get("apt_mid", 10.0)
+                    return max(0.0, (apt_bal - 0.5) * apt_price)
+                return settings.trade_amount_usdt
+
+            elif route_type == "CEX_CEX":
+                # Need USDT on Buy Exchange
+                if ex_id:
+                    return bm.get_free(ex_id, "USDT")
+                return settings.trade_amount_usdt
+
+        except Exception as e:
+            logger.error(f"Error calculating max balance for {route_type}: {e}")
+            
+        return settings.trade_amount_usdt
 
     def _eval_profit(self, size_usdt: float, route_type: str, **kwargs) -> float:
         """Evaluate expected net profit (in USDT) for a given trade size."""
@@ -1466,12 +1596,40 @@ class ArbitrageEngine:
                     ami_bid=best_ami_bid, ami_fee=bid_fee,
                     apt_ask=best_apt_ask, apt_fee=ask_fee
                 )
-                profit = self._eval_profit(
-                    opt_size, "CROSS_CEX_CIRCULAR_AMI",
-                    ami_mid=ami_mid, r_apt=r_apt, r_ami=r_ami,
-                    ami_bid=best_ami_bid, ami_fee=bid_fee,
-                    apt_ask=best_apt_ask, apt_fee=ask_fee
-                )
+                # 1. Cap by available balance (CEX AMI)
+                opt_size = self._calculate_max_affordable_size(best_ami_bid_ex, "AMI", opt_size)
+                
+                # 2. Cap by available USDT on CEX2 (best_apt_ask_ex)
+                if opt_size > 0:
+                    # Estimate USDT needed for Leg 2 (conservative)
+                    ami_qty_est = opt_size / ami_mid
+                    usdt_needed = ami_qty_est * best_ami_bid * (1.1) # 10% buffer for price/fee
+                    max_usdt_cex2 = self._calculate_max_affordable_size(best_apt_ask_ex, "USDT", usdt_needed)
+                    if max_usdt_cex2 < usdt_needed:
+                        # Scale down opt_size based on USDT availability
+                        opt_size = opt_size * (max_usdt_cex2 / usdt_needed)
+
+                # 3. Cap by available APT on DEX (for Leg 3)
+                if opt_size > 0:
+                    # Estimate APT needed for Leg 3
+                    usdt_out_est = (opt_size / ami_mid) * best_ami_bid * (1.0 - bid_fee)
+                    apt_qty_est = usdt_out_est / best_apt_ask
+                    apt_needed = apt_qty_est * (1.1) # 10% buffer
+                    # Convert apt_needed to USDT equivalent for _calculate_max_affordable_size
+                    apt_needed_usdt = apt_needed * best_apt_ask
+                    max_apt_dex_usdt = self._calculate_max_affordable_size("dex", "APT", apt_needed_usdt)
+                    if max_apt_dex_usdt < apt_needed_usdt:
+                        opt_size = opt_size * (max_apt_dex_usdt / apt_needed_usdt)
+
+                if opt_size <= 0:
+                    profit = -1
+                else:
+                    profit = self._eval_profit(
+                        opt_size, "CROSS_CEX_CIRCULAR_AMI",
+                        ami_mid=ami_mid, r_apt=r_apt, r_ami=r_ami,
+                        ami_bid=best_ami_bid, ami_fee=bid_fee,
+                        apt_ask=best_apt_ask, apt_fee=ask_fee
+                    )
                 if profit > self.min_profit:
                     direction = "CROSS_CEX_CIRCULAR_AMI"
                     log_msg = (
@@ -1488,7 +1646,7 @@ class ArbitrageEngine:
                     legs = [
                         TradeLeg(best_ami_bid_ex.lower(), self.cex_symbol, LegSide.SELL, ami_qty, best_ami_bid, tag=f"sell_ami_{best_ami_bid_ex}"),
                         TradeLeg(best_apt_ask_ex.lower(), self.apt_cex_symbol, LegSide.BUY, apt_qty, best_apt_ask, tag=f"buy_apt_{best_apt_ask_ex}"),
-                        TradeLeg("cellana", "AMI/APT", LegSide.BUY, apt_qty, float(ami_end / apt_qty) if apt_qty > 0 else 0.0, is_dex=True, dex_direction="apt_to_ami", tag="dex_apt_to_ami")
+                        TradeLeg("dex", "AMI/APT", LegSide.BUY, apt_qty, float(ami_end / apt_qty) if apt_qty > 0 else 0.0, is_dex=True, dex_direction="apt_to_ami", tag="dex_apt_to_ami")
                     ]
                     results.append(Opportunity(direction, profit, legs, float(best_ami_bid), float(best_apt_ask), log_msg))
 
@@ -1532,12 +1690,37 @@ class ArbitrageEngine:
                         apt_bid=best_apt_bid, apt_fee=apt_bid_fee,
                         ami_ask=best_ami_ask, ami_fee=ami_ask_fee
                     )
-                    profit_apt = self._eval_profit(
-                        opt_size_apt, "CROSS_CEX_CIRCULAR_APT",
-                        apt_mid=apt_mid, r_apt=r_apt, r_ami=r_ami,
-                        apt_bid=best_apt_bid, apt_fee=apt_bid_fee,
-                        ami_ask=best_ami_ask, ami_fee=ami_ask_fee
-                    )
+                    # 1. Cap by available balance (CEX APT on CEX1)
+                    opt_size_apt = self._calculate_max_affordable_size(best_apt_bid_ex, "APT", opt_size_apt)
+                    
+                    # 2. Cap by available USDT on CEX2 (best_ami_ask_ex)
+                    if opt_size_apt > 0:
+                        apt_qty_est = opt_size_apt / apt_mid
+                        usdt_needed = apt_qty_est * best_apt_bid * (1.1) # 10% buffer
+                        max_usdt_cex2 = self._calculate_max_affordable_size(best_ami_ask_ex, "USDT", usdt_needed)
+                        if max_usdt_cex2 < usdt_needed:
+                            opt_size_apt = opt_size_apt * (max_usdt_cex2 / usdt_needed)
+                            
+                    # 3. Cap by available AMI on DEX (for Leg 3)
+                    if opt_size_apt > 0:
+                        usdt_out_est = (opt_size_apt / apt_mid) * best_apt_bid * (1.0 - apt_bid_fee)
+                        ami_qty_est = usdt_out_est / best_ami_ask
+                        ami_needed = ami_qty_est * (1.1) # 10% buffer
+                        # Convert to USDT for sizing
+                        ami_needed_usdt = ami_needed * best_ami_ask
+                        max_ami_dex_usdt = self._calculate_max_affordable_size("dex", "AMI", ami_needed_usdt)
+                        if max_ami_dex_usdt < ami_needed_usdt:
+                            opt_size_apt = opt_size_apt * (max_ami_dex_usdt / ami_needed_usdt)
+
+                    if opt_size_apt <= 0:
+                        profit_apt = -1
+                    else:
+                        profit_apt = self._eval_profit(
+                            opt_size_apt, "CROSS_CEX_CIRCULAR_APT",
+                            apt_mid=apt_mid, r_apt=r_apt, r_ami=r_ami,
+                            apt_bid=best_apt_bid, apt_fee=apt_bid_fee,
+                            ami_ask=best_ami_ask, ami_fee=ami_ask_fee
+                        )
                 if profit_apt > self.min_profit:
                     direction = "CROSS_CEX_CIRCULAR_APT"
                     log_msg = (
@@ -1554,7 +1737,7 @@ class ArbitrageEngine:
                     legs = [
                         TradeLeg(best_apt_bid_ex.lower(), self.apt_cex_symbol, LegSide.SELL, apt_qty, best_apt_bid, tag=f"sell_apt_{best_apt_bid_ex}"),
                         TradeLeg(best_ami_ask_ex.lower(), self.cex_symbol, LegSide.BUY, ami_qty, best_ami_ask, tag=f"buy_ami_{best_ami_ask_ex}"),
-                        TradeLeg("cellana", "AMI/APT", LegSide.BUY, ami_qty, float(apt_end / ami_qty) if ami_qty > 0 else 0.0, is_dex=True, dex_direction="ami_to_apt", tag="dex_ami_to_apt")
+                        TradeLeg("dex", "AMI/APT", LegSide.SELL, ami_qty, float(apt_end / ami_qty) if ami_qty > 0 else 0.0, is_dex=True, dex_direction="ami_to_apt", tag="dex_ami_to_apt")
                     ]
                     results.append(Opportunity(direction, profit_apt, legs, float(best_apt_bid), float(best_ami_ask), log_msg))
         

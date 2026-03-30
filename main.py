@@ -89,7 +89,8 @@ async def main() -> None:
     mexc  = MexcWS(collector,  symbols=cex_symbols) if enable_mexc else None
 
     # --- Trade execution ---
-    trade_executor  = TradeExecutor()
+    trade_executor  = TradeExecutor(price_collector=collector)
+    await trade_executor.init_traders()
     balance_manager = BalanceManager(
         bybit_trader=trade_executor.bybit, 
         mexc_trader=trade_executor.mexc,
@@ -168,8 +169,10 @@ async def main() -> None:
         logger.warning("[Arb] All exchanges disabled — arb engine not started")
     if cellana_listener:
         tasks.append(asyncio.create_task(cellana_listener.run(), name="cellana_swaps"))
+        await asyncio.sleep(2) # Stagger start
     if hyperion_listener:
         tasks.append(asyncio.create_task(hyperion_listener.run(), name="hyperion_swaps"))
+        await asyncio.sleep(2) # Stagger start
 
     # --- Balance auto-refresh loop (optional but recommended for /status freshness) ---
     tasks.append(asyncio.create_task(balance_manager.run_refresh_loop(), name="balance_refresher"))
@@ -187,9 +190,14 @@ async def main() -> None:
 
     # --- Rebalance Manager (CEX -> DEX refill) ---
     if settings.rebalance_enabled:
-        rebalance_min = settings.rebalance_interval_min * 60 if hasattr(settings, "rebalance_interval_min") else 1800
-        rebalancer = RebalanceManager(balance_manager, telegram=tg_notifier, check_interval_s=rebalance_min)
-        tasks.append(asyncio.create_task(rebalancer.run_loop(), name="rebalance_manager"))
+        rebalancer = RebalanceManager(
+            balance_manager=balance_manager,
+            bybit_trader=trade_executor.bybit,
+            mexc_trader=trade_executor.mexc
+        )
+        tasks.append(asyncio.create_task(rebalancer.start(), name="rebalance_manager"))
+        # Link to arb engine for post-trade rebalance check
+        arb.rebalancer = rebalancer
     else:
         logger.info("⚖️ RebalanceManager is disabled in settings")
 

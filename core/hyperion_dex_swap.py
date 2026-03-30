@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import traceback
 from dataclasses import dataclass
 from typing import Optional
 
@@ -59,9 +60,9 @@ HYPERION_POOL_V3 = f"{HYPERION_MODULE}::pool_v3"
 APT_METADATA_ADDRESS = "0xa"
 USDT_METADATA_ADDRESS = "0x357b0b74bc833e95a115ad22604854d6b0fca151cecd94111770e5d6ffc9dc2b"
 
-# fee_rate 10000 = mapping to Tier 100 (charges actual 0.1% as per SwapEventV3)
+# fee_rate 1000 = mapping to Tier 10 (charges actual 0.1% as per SwapEventV3)
 # This Tier is mandatory to find the pool on Hyperion Router
-HYPERION_FEE_TIER = 100
+HYPERION_FEE_TIER = 10
 
 # Decimals
 APT_DECIMALS = 8
@@ -159,6 +160,7 @@ class HyperionDexSwap:
         slippage_pct: Optional[float] = None,
     ) -> SwapResult:
         """Swap APT → AMI via Hyperion router_v3::exact_input_swap_entry."""
+        logger.debug(f"Hyperion: swap_apt_to_ami called with {amount_apt:.6f} APT")
         t0 = time.time()
         slippage = slippage_pct or self.default_slippage_pct
         amount_in_raw = _to_octas(amount_apt, APT_DECIMALS)
@@ -203,6 +205,7 @@ class HyperionDexSwap:
         slippage_pct: Optional[float] = None,
     ) -> SwapResult:
         """Swap AMI → APT via Hyperion router_v3::exact_input_swap_entry."""
+        logger.debug(f"Hyperion: swap_ami_to_apt called with {amount_ami:.4f} AMI")
         t0 = time.time()
         slippage = slippage_pct or self.default_slippage_pct
         amount_in_raw = _to_octas(amount_ami, AMI_DECIMALS)
@@ -303,12 +306,22 @@ class HyperionDexSwap:
             ],
         }
         session = await self._get_http_session()
-        async with session.post(url, json=payload) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                raise ValueError(f"Hyperion view function failed ({resp.status}): {body}")
-            data = await resp.json()
-
+        try:
+            logger.debug(f"Hyperion: Calling get_amount_out view function... (in={amount_in_raw})")
+            # Use aiohttp built-in timeout for compatibility with older Python versions
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=25)) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    raise ValueError(f"Hyperion view function failed ({resp.status}): {body}")
+                data = await resp.json()
+            logger.debug("Hyperion: View function returned successfully.")
+        except asyncio.TimeoutError:
+            logger.error("Hyperion: get_amount_out view function TIMED OUT after 25s")
+            raise
+        except Exception as e:
+            logger.error(f"Hyperion: Error calling view function: {e}")
+            raise
+ 
         if isinstance(data, (list, tuple)) and len(data) >= 2:
             return int(data[0]), int(data[1])
         raise ValueError(f"Unexpected view response: {data}")
@@ -371,15 +384,28 @@ class HyperionDexSwap:
         try:
             tx_payload = TransactionPayload(entry_fn)
 
-            signed_tx = await self.client.create_bcs_signed_transaction(
-                sender=self.account,
-                payload=tx_payload,
-            )
+            logger.info(f"🔁 {label}: Building signed transaction...")
+            try:
+                signed_tx = await asyncio.wait_for(
+                    self.client.create_bcs_signed_transaction(
+                        sender=self.account,
+                        payload=tx_payload,
+                    ),
+                    timeout=25
+                )
+                logger.info(f"📝 {label}: Transaction built and signed.")
+            except asyncio.TimeoutError:
+                raise TimeoutError(f"{label}: Building transaction timed out after 25s")
 
-            logger.info(f"📤 Submitting {label} swap tx...")
-            tx_response = await self.client.submit_and_wait_for_bcs_transaction(
-                signed_tx
-            )
+            logger.info(f"📤 {label}: Submitting transaction and waiting for confirmation...")
+            try:
+                tx_response = await asyncio.wait_for(
+                    self.client.submit_and_wait_for_bcs_transaction(signed_tx),
+                    timeout=25
+                )
+                logger.info(f"✅ {label}: Transaction confirmed by node.")
+            except asyncio.TimeoutError:
+                raise TimeoutError(f"{label}: Submitting transaction timed out after 25s")
 
             elapsed = (time.time() - t0) * 1000
             result.elapsed_ms = elapsed
@@ -415,7 +441,8 @@ class HyperionDexSwap:
             elapsed = (time.time() - t0) * 1000
             result.elapsed_ms = elapsed
             result.error = str(e)
-            logger.error(f"❌ {label} EXCEPTION | {e} | {elapsed:.0f}ms")
+            stack = traceback.format_exc()
+            logger.error(f"❌ {label} EXCEPTION | {e} | {elapsed:.0f}ms\n{stack}")
 
         return result
 

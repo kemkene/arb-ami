@@ -4,7 +4,7 @@ import json
 import time
 import datetime
 import threading
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, List
 from google.protobuf.json_format import MessageToDict
 
 from config.settings import settings
@@ -181,158 +181,89 @@ class CellanaSwapListener:
         return parsed
 
     def _get_latest_version(self) -> int:
-        """Query latest transaction version from Aptos REST API.
+        """Query latest transaction version from Aptos REST API with rotation."""
+        import requests
         
-        Returns the version of the most recent transaction on-chain.
-        Used when starting_version=0 to begin streaming from latest.
-        """
-        try:
-            import requests
-            
-            logger.info("🔍 Querying latest transaction version from blockchain...")
-            
-            # Use Aptos public REST API to get ledger info
-            # Aptos mainnet REST API: https://fullnode.mainnet.aptoslabs.com/v1
-            rest_api_url = "https://fullnode.mainnet.aptoslabs.com/v1"
-            
-            response = requests.get(rest_api_url, timeout=10)
-            response.raise_for_status()
-            
-            ledger_info = response.json()
-            latest_version = int(ledger_info.get("ledger_version", 0))
-            
-            if latest_version > 0:
-                logger.info(f"✅ Latest blockchain version: {latest_version:,}")
-                return latest_version
-            else:
-                logger.warning("⚠️ Could not parse ledger_version from API response")
-                return 0
-            
-        except Exception as e:
-            logger.error(f"❌ Error fetching latest version: {e}")
-            return 0
+        # Try all configured URLs
+        urls = settings.aptos_node_urls
+        for url in urls:
+            try:
+                logger.info(f"🔍 Querying latest version from: {url}")
+                response = requests.get(url, timeout=5)
+                if response.status_code == 429:
+                    logger.warning(f"⚠️ Node {url} rate limited (429), trying next...")
+                    continue
+                response.raise_for_status()
+                ledger_info = response.json()
+                latest_version = int(ledger_info.get("ledger_version", 0))
+                if latest_version > 0:
+                    logger.info(f"✅ Latest version: {latest_version:,} (from {url})")
+                    return latest_version
+            except Exception as e:
+                logger.debug(f"Failed to fetch version from {url}: {e}")
+                continue
+        return 0
 
     def _bootstrap_pool_reserves(self, silent: bool = False) -> Optional[Dict[str, Any]]:
-        """Bootstrap current pool reserves from Cellana at startup.
+        """Bootstrap reserves from Cellana with RPC rotation support."""
+        import requests
         
-        Queries pool_reserves view function to get initial AMI and APT reserves
-        without waiting for SyncEvent. This ensures the arbitrage engine has
-        price data immediately when starting.
+        if not silent:
+            logger.info("🔄 Bootstrapping Cellana reserves (with RPC rotation)...")
         
-        View function: 
-        liquidity_pool::pool_reserves<CoinType_1, CoinType_2>(pool_id)
-        
-        For AMI/APT pool:
-        - Module: 0x4bf51972879e3b95c4781a5cdcb9e1ee24ef483e7d22f2d903626f126df62bd1::liquidity_pool
-        - Function: pool_reserves
-        - Generic params: 
-          T0: 0x1::object::ObjectCore (pool_id type)
-          T1: AMI token type
-          T2: APT token type
-        
-        Returns:
-            True if successfully initialized, False otherwise
-        """
-        try:
-            import requests
-            
-            if not silent:
-                logger.info("🔄 Bootstrapping initial pool reserves from Cellana...")
-            
-            rest_api_url = "https://fullnode.mainnet.aptoslabs.com/v1"
-            
-            # Query pool_reserves view function
-            # Module: 0x4bf51972879e3b95c4781a5cdcb9e1ee24ef483e7d22f2d903626f126df62bd1::liquidity_pool
-            # Function: pool_reserves<T0: ObjectCore>(pool_id: address) -> (u128, u128)
-            cellana_module = "0x4bf51972879e3b95c4781a5cdcb9e1ee24ef483e7d22f2d903626f126df62bd1"
-            liquidity_pool_module = f"{cellana_module}::liquidity_pool"
-            
-            # Generic type parameter: T0 = ObjectCore (for pool_id type constraint)
-            object_core_type = "0x1::object::ObjectCore"
-            
-            # Pool ID argument
-            pool_id = self.AMI_APT_POOL
-            
-            view_request = {
-                "function": f"{liquidity_pool_module}::pool_reserves",
-                "type_arguments": [object_core_type],
-                "arguments": [pool_id],
-            }
-            
-            logger.debug(f"View request: {json.dumps(view_request, indent=2)}")
-            
-            # Call view function via REST API
-            response = requests.post(
-                f"{rest_api_url}/view",
-                json=view_request,
-                timeout=10
-            )
-            response.raise_for_status()
-            
-            result = response.json()
-            
-            # View function returns a tuple: (reserve_1, reserve_2)
-            # For AMI/APT pool: (AMI reserves, APT reserves)
-            if isinstance(result, list) and len(result) >= 2:
-                reserves_ami = int(result[0])
-                reserves_apt = int(result[1])
-                
-                # Create synthetic SyncEvent payload
-                payload = {
-                    "type": "pool_reserves_bootstrap",
-                    "pool": self.AMI_APT_POOL,
-                    "parsed": {
-                        "reserves_1": reserves_ami,
-                        "reserves_2": reserves_apt,
-                    },
-                    "timestamp": datetime.datetime.now().isoformat(),
-                    "source": "bootstrap"
+        urls = settings.aptos_node_urls
+        for url in urls:
+            try:
+                view_request = {
+                    "function": "0x4bf51972879e3b95c4781a5cdcb9e1ee24ef483e7d22f2d903626f126df62bd1::liquidity_pool::pool_reserves",
+                    "type_arguments": ["0x1::object::ObjectCore"],
+                    "arguments": [self.AMI_APT_POOL],
                 }
                 
-                # Calculate price from reserves
-                price_spot = self._calculate_price(reserves_ami, reserves_apt, self.AMI_APT_POOL, include_fee=False)
-                price_with_fee = self._calculate_price(reserves_ami, reserves_apt, self.AMI_APT_POOL, include_fee=True)
+                response = requests.post(f"{url}/view", json=view_request, timeout=5)
+                if response.status_code == 429:
+                    if not silent: logger.warning(f"⚠️ Node {url} rate limited (429)")
+                    continue
                 
-                if price_spot:
-                    self.last_update_ts = time.time()
-                    if not silent:
-                        logger.success(
-                            f"✅ [BOOTSTRAP] AMI/APT Pool Initialized\n"
-                            f"   Reserves: AMI={reserves_ami:,} | APT={reserves_apt:,}\n"
-                            f"   Price (spot): {price_spot:.8f} AMI/APT\n"
-                            f"   Price (+fee): {price_with_fee:.8f} AMI/APT"
-                        )
+                response.raise_for_status()
+                result = response.json()
+                
+                # View function returns a tuple: (reserve_1, reserve_2) 
+                # For AMI/APT pool: (AMI reserves, APT reserves)
+                if isinstance(result, list) and len(result) >= 2:
+                    reserves_ami = int(result[0])
+                    reserves_apt = int(result[1])
                     
-                    # Return payload to be handled in async run()
-                    return {
-                        "type": "pool_reserves_bootstrap",
-                        "pool": self.AMI_APT_POOL,
-                        "parsed": {
-                            "reserves_1": reserves_ami,
-                            "reserves_2": reserves_apt,
-                        },
-                        "timestamp": datetime.datetime.now().isoformat(),
-                        "price_ami_per_apt_spot": price_spot,
-                        "price_ami_per_apt_with_fee": price_with_fee,
-                        "source": "bootstrap"
-                    }
-                return None
-            return None
-        except Exception as e:
-            if not silent:
-                logger.error(f"❌ Error bootstrapping pool reserves: {e}")
-            return None
-            
-        except Exception as e:
-            logger.error(f"❌ Error bootstrapping pool reserves: {e}")
-            try:
-                logger.debug(f"Response status: {response.status_code if 'response' in locals() else 'N/A'}")
-                logger.debug(f"Response text: {response.text if 'response' in locals() else 'N/A'}")
-            except:
-                pass
-            import traceback
-            logger.debug(traceback.format_exc())
-            return False
+                    # Calculate price from reserves
+                    price_spot = self._calculate_price(reserves_ami, reserves_apt, self.AMI_APT_POOL, include_fee=False)
+                    price_with_fee = self._calculate_price(reserves_ami, reserves_apt, self.AMI_APT_POOL, include_fee=True)
+                    
+                    if price_spot:
+                        self.last_update_ts = time.time()
+                        if not silent:
+                            logger.success(
+                                f"✅ [BOOTSTRAP] AMI/APT Pool Initialized (via {url})\n"
+                                f"   Reserves: AMI={reserves_ami:,} | APT={reserves_apt:,}\n"
+                                f"   Price (spot): {price_spot:.8f} AMI/APT"
+                            )
+                        
+                        return {
+                            "type": "pool_reserves_bootstrap",
+                            "pool": self.AMI_APT_POOL,
+                            "parsed": {
+                                "reserves_1": reserves_ami,
+                                "reserves_2": reserves_apt,
+                            },
+                            "timestamp": datetime.datetime.now().isoformat(),
+                            "price_ami_per_apt_spot": price_spot,
+                            "price_ami_per_apt_with_fee": price_with_fee,
+                            "source": "bootstrap"
+                        }
+            except Exception as e:
+                if not silent:
+                    logger.debug(f"Bootstrap attempt failed for {url}: {e}")
+                continue
+        return None
 
     # ------------------------------------------------------------------ #
     #  REST-based pool reserve polling (complements gRPC event stream)
@@ -520,15 +451,14 @@ class CellanaSwapListener:
                                     f"({len(txs)} txs) - contains events"
                                 )
 
-                            if current_version != batch_start_version:
+                            if current_version < batch_start_version:
                                 logger.warning(
-                                    f"Version gap detected: expected {current_version}, "
-                                    f"got {batch_start_version}"
+                                    f"⚠️ [GAP] Version gap: expected {current_version}, "
+                                    f"got {batch_start_version} (skipped {batch_start_version - current_version} txs)"
                                 )
-                                logger.info(f"[GAP] Detected version gap at {datetime.datetime.now()} (expected={current_version}, got={batch_start_version})")
                                 current_version = batch_start_version
 
-                            latest_event_per_pool: Dict[str, Dict[str, Any]] = {}
+                            all_matched_events: List[Dict[str, Any]] = []
 
                             for tx in txs:
                                 version = tx.version if hasattr(tx, 'version') else None
@@ -547,10 +477,6 @@ class CellanaSwapListener:
                                     is_v2_sync = ev_type == self.swap_event_type
                                     
                                     if not is_v2_sync:
-                                        # Reduce noise: only log other liquidity events at higher debug level if needed
-                                        # logging thousands of events per block slows down the processor
-                                        # if version and ("liquidity_pool" in ev_type or "Sync" in ev_type or "swap" in ev_type.lower()):
-                                        #     logger.debug(f"  📍 TX v={version} Event[{event_index}]: {ev_type}")
                                         continue
 
                                     logger.success(
@@ -568,9 +494,6 @@ class CellanaSwapListener:
                                                 )
                                         else:
                                             logger.debug(f"  No data in event payload")
-                                    except json.JSONDecodeError as json_err:
-                                        logger.debug(f"Failed to parse event data as JSON: {json_err}")
-                                        data_dict = {"raw": str(ev.data)}
                                     except Exception as parse_err:
                                         logger.debug(f"Failed to parse event data: {parse_err}")
                                         data_dict = {"raw": str(getattr(ev, "data", ev))}
@@ -590,27 +513,29 @@ class CellanaSwapListener:
                                         "data": data_dict,
                                         "parsed": parsed,
                                     }
-                                    latest_event_per_pool[event_pool.lower()] = payload
+                                    all_matched_events.append(payload)
 
-                                if version is not None:
-                                    current_version = max(current_version, version + 1)
-                                    self.starting_version = current_version
-                                    self.is_grpc_active = True
+                                    if version is not None:
+                                        current_version = max(current_version, version + 1)
+                                        self.starting_version = current_version
+                                        self.is_grpc_active = True
+                            
+                            # Ensure current_version is always moved to the end of the batch
+                            current_version = max(current_version, batch_end_version + 1)
+                            self.starting_version = current_version
 
-                            if processed_count % 10 == 0 and processed_count > 0:
-                                logger.info(
-                                    f"✓ Checkpoint: current_version={current_version} "
-                                    f"| events_found={processed_count}"
-                                )
-
-                            # Push latest event from this batch into the async queue
-                            if latest_event_per_pool:
-                                processed_count += len(latest_event_per_pool)
-                                for payload in latest_event_per_pool.values():
-                                    # thread-safe: schedule put on the event loop
-                                    loop.call_soon_threadsafe(event_queue.put_nowait, payload)
+                            # ⚠️ SỬA LỖI: Đẩy TẤT CẢ event đã khớp vào Queue để trigger engine
+                            if all_matched_events:
+                                logger.debug(f"  📤 Pushing {len(all_matched_events)} matched events to consumer queue")
+                                for p in all_matched_events:
+                                    processed_count += 1
+                                    # Trigger log ngay tại đây để biết event nào sắp được xử lý
+                                    logger.debug(f"⚡ [TRIGGER] Reactive check queue push for Cellana v={p.get('version')}")
+                                    # thread-safe
+                                    loop.call_soon_threadsafe(event_queue.put_nowait, p)
 
                             if processed_count > 0 and processed_count % status_interval == 0:
+                                logger.info(f"  📊 Status: Processed {processed_count} swap events since start.")
                                 logger.info(
                                     f"[CELLANA STATUS] Processed {processed_count} events, "
                                     f"current_version={current_version}"
@@ -658,9 +583,20 @@ class CellanaSwapListener:
                         # Stream ended or errored — break to reconnect
                         break
 
-                    version = payload['version']
-                    sender = payload['sender']
-                    parsed = payload['parsed']
+                    # 1. Trigger callback immediately (Reactive)
+                    if self.on_swap_event:
+                        try:
+                            if asyncio.iscoroutinefunction(self.on_swap_event):
+                                asyncio.create_task(self.on_swap_event(payload))
+                            else:
+                                self.on_swap_event(payload)
+                        except Exception as cb_err:
+                            logger.warning(f"Cellana swap callback error: {cb_err}")
+
+                    # 2. Process data for logging and internal state
+                    version = payload.get('version')
+                    sender = payload.get('sender')
+                    parsed = payload.get('parsed', {})
                     reserves_1 = parsed.get('reserves_1')
                     reserves_2 = parsed.get('reserves_2')
                     pool = parsed.get('pool')
@@ -678,63 +614,29 @@ class CellanaSwapListener:
                             parsed['price_ami_per_apt_spot'] = price_spot
                             parsed['price_ami_per_apt_with_fee'] = price_with_fee
                             payload['price_ami_per_apt_spot'] = price_spot
-                            payload['price_ami_per_apt_with_fee'] = price_with_fee
-                            payload['price_ami_per_apt_with_fee'] = price_with_fee
                             payload['price_ami_per_apt'] = price_spot
                         
                         self.last_update_ts = time.time()
 
-                    # V3 logic
-                    if parsed.get("is_v3"):
-                        sqrt_p = parsed.get("sqrt_price_x64")
-                        if sqrt_p:
-                            from core.hyperion_math import decode_sqrt_price
-                            # Cellana V3 uses sqrtPriceX64 similar to Hyperion/UniswapV3
-                            # price = (sqrtPrice / 2^64)^2
-                            price_spot = float(decode_sqrt_price(sqrt_p)**2)
-                            # For parity with Hyperion: 
-                            # If pool is AMI/APT, decode_sqrt_price might return AMI per APT or vice-versa
-                            # depending on token order. 
-                            # Let's assume standard order for now or just log it.
-                            parsed['price_ami_per_apt_spot'] = price_spot
-                            payload['price_ami_per_apt_spot'] = price_spot
-                            payload['price_ami_per_apt'] = price_spot
-
-                    price_spot_str = f"{price_spot:.8f}" if price_spot else "None"
-                    price_fee_str = f"{price_with_fee:.8f}" if price_with_fee else "None"
-
-                    logger.info(
-                        f"💰 [AMI/APT PRICE] "
-                        f"v={version} | "
-                        f"spot={price_spot_str} | "
-                        f"+fee={price_fee_str} | "
-                        f"reserves_AMI={reserves_1:,} | "
-                        f"reserves_APT={reserves_2:,}"
-                    )
-
+                    # 3. Log results
                     if price_spot and price_with_fee:
+                        price_spot_str = f"{price_spot:.8f}"
+                        price_fee_str = f"{price_with_fee:.8f}"
+                        logger.info(
+                            f"💰 [AMI/APT PRICE] v={version} | spot={price_spot_str} | +fee={price_fee_str} | "
+                            f"reserves_AMI={reserves_1:,} | reserves_APT={reserves_2:,}"
+                        )
+                        
                         log_price_update({
                             "pool": pool,
                             "pool_name": "AMI/APT",
                             "version": int(version) if version else None,
-                            "reserves_1": int(reserves_1) if reserves_1 else None,
-                            "reserves_2": int(reserves_2) if reserves_2 else None,
-                            "reserves_ami": int(reserves_1) if reserves_1 else None,
-                            "reserves_apt": int(reserves_2) if reserves_2 else None,
+                            "reserves_ami": int(reserves_1),
+                            "reserves_apt": int(reserves_2),
                             "price_spot": float(price_spot),
                             "price_with_fee": float(price_with_fee),
-                            "fee_pct": 0.1,
                             "source": "cellana_dex",
                         })
-
-                    if self.on_swap_event:
-                        try:
-                            if asyncio.iscoroutinefunction(self.on_swap_event):
-                                asyncio.create_task(self.on_swap_event(payload))
-                            else:
-                                self.on_swap_event(payload)
-                        except Exception as cb_err:
-                            logger.warning(f"Cellana swap callback error: {cb_err}")
 
                 # Clean up thread
                 stop_event.set()

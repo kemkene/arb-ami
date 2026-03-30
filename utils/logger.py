@@ -21,7 +21,7 @@ logger.add(
         "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | "
         "{message}"
     ),
-    level="INFO",
+    level="DEBUG",
 )
 
 # Rotating file log — all levels including DEBUG price ticks

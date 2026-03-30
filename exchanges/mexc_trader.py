@@ -7,7 +7,7 @@ import hmac
 import time
 import urllib.parse
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, Optional, Any, List
 
 import aiohttp
 
@@ -43,6 +43,7 @@ class MexcTrader:
         # Offset (ms) = server_time - local_time
         self._time_offset_ms: int = 0
         self._last_sync_ts: float = 0.0
+        self.instrument_info: Dict[str, dict] = {}
 
     def _is_configured(self) -> bool:
         return bool(self.api_key and self.api_secret)
@@ -111,7 +112,7 @@ class MexcTrader:
                     f"{BASE_URL}/api/v3/account",
                     params=params,
                     headers={"X-MEXC-APIKEY": self.api_key},
-                    timeout=aiohttp.ClientTimeout(total=10),
+                    timeout=aiohttp.ClientTimeout(total=20),
                 ) as resp:
                     data = await resp.json()
 
@@ -130,7 +131,7 @@ class MexcTrader:
                             f"{BASE_URL}/api/v3/account",
                             params=params,
                             headers={"X-MEXC-APIKEY": self.api_key},
-                            timeout=aiohttp.ClientTimeout(total=10),
+                            timeout=aiohttp.ClientTimeout(total=20),
                         ) as resp:
                             data = await resp.json()
                     if "code" in data and data["code"] != 200:
@@ -223,6 +224,44 @@ class MexcTrader:
         )
         return OrderResult(order_id=order_id, status="POLL_TIMEOUT")
 
+    async def sync_instrument_info(self, symbol: str) -> None:
+        """Fetch baseAssetPrecision for a symbol from MEXC V3."""
+        try:
+            params = {"symbol": symbol}
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{BASE_URL}/api/v3/exchangeInfo",
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as resp:
+                    data = await resp.json()
+            
+            if "symbols" in data:
+                for s_info in data["symbols"]:
+                    if s_info["symbol"] == symbol:
+                        self.instrument_info[symbol] = s_info
+                        logger.info(f"📊 [MEXC] Synced instrument info for {symbol}")
+                        break
+            else:
+                logger.warning(f"⚠️ MEXC: Failed to sync info for {symbol}: {data.get('msg')}")
+        except Exception as e:
+            logger.error(f"MEXC sync_instrument_info error: {e}")
+
+    def round_quantity(self, symbol: str, qty: float) -> float:
+        """Round quantity to the baseAssetPrecision / quotePrecision of the symbol."""
+        info = self.instrument_info.get(symbol)
+        if not info:
+            # Fallback to 2 decimal places if info not yet synced
+            return float(int(qty * 100) / 100.0)
+            
+        # MEXC uses integer precision (e.g., 2 means 0.01)
+        # Note: If buying with quoteOrderQty, we should use quotePrecision
+        # But for base quantity, use baseAssetPrecision.
+        prec = info.get("baseAssetPrecision", 2)
+        
+        factor = 10 ** prec
+        return float(int(qty * factor) / factor)
+
     async def place_market_order(
         self,
         symbol: str,
@@ -241,6 +280,22 @@ class MexcTrader:
 
         await self._ensure_time_synced()
 
+        # Round quantity to exchange precision
+        # Note: MEXC BUY with is_quote_qty uses quote asset (USDT)
+        if is_quote_qty:
+            # For USDT, 2 decimal places is usually safe, 
+            # or we could use quotePrecision from instrument_info
+            info = self.instrument_info.get(symbol)
+            q_prec = info.get("quotePrecision", 2) if info else 2
+            factor = 10 ** q_prec
+            qty = float(int(qty * factor) / factor)
+        else:
+            qty = self.round_quantity(symbol, qty)
+            
+        if qty <= 0:
+            logger.error(f"❌ MEXC order aborted: quantity {qty} is too small after rounding.")
+            return None
+
         timestamp = self._now_ms()
         params: dict = {
             "symbol": symbol,
@@ -250,9 +305,9 @@ class MexcTrader:
             "recvWindow": str(_RECV_WINDOW_MS),
         }
         if is_quote_qty:
-            params["quoteOrderQty"] = str(qty)
+            params["quoteOrderQty"] = f"{qty:g}"
         else:
-            params["quantity"] = str(qty)
+            params["quantity"] = f"{qty:g}"
 
         query_string = urllib.parse.urlencode(params)
         signature = self._sign(query_string)
@@ -269,7 +324,7 @@ class MexcTrader:
                         "Content-Type": "application/json",
                     },
                     params=params,
-                    timeout=aiohttp.ClientTimeout(total=10),
+                    timeout=aiohttp.ClientTimeout(total=20),
                 ) as resp:
                     data = await resp.json()
 
@@ -327,11 +382,16 @@ class MexcTrader:
 
         try:
             async with aiohttp.ClientSession() as session:
+                # Last resort attempt: explicit JSON content type and body
+                h = {
+                    "X-MEXC-APIKEY": self.api_key,
+                    "Content-Type": "application/json"
+                }
                 async with session.post(
                     f"{BASE_URL}/api/v3/capital/withdraw/apply",
-                    headers={"X-MEXC-APIKEY": self.api_key},
-                    params=params,
-                    timeout=aiohttp.ClientTimeout(total=10),
+                    headers=h,
+                    params=params, # MEXC sometimes wants it in both or either
+                    timeout=aiohttp.ClientTimeout(total=20),
                 ) as resp:
                     data = await resp.json()
 
@@ -347,6 +407,73 @@ class MexcTrader:
                 return None
         except Exception as e:
             logger.error(f"❌ MEXC withdrawal exception: {e}")
+            return None
+
+    async def get_deposit_address(self, coin: str, network: str) -> Optional[str]:
+        """
+        Query deposit address for a specific coin and network.
+        Endpoint: GET /api/v3/capital/deposit/address
+        """
+        if not self._is_configured():
+            return None
+
+        await self._ensure_time_synced()
+        params = {
+            "coin": coin,
+            "network": network,
+            "timestamp": self._now_ms(),
+            "recvWindow": str(_RECV_WINDOW_MS),
+        }
+        query_string = urllib.parse.urlencode(params)
+        params["signature"] = self._sign(query_string)
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{BASE_URL}/api/v3/capital/deposit/address",
+                    headers={"X-MEXC-APIKEY": self.api_key},
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=20),
+                ) as resp:
+                    data = await resp.json()
+
+            logger.debug(f"🔍 [MEXC] Deposit response for {coin}: {data}")
+
+            # MEXC API can return a list or a dict depending on the exact endpoint/version
+            # V3 usually returns a dict with 'address' and 'tag'
+            if isinstance(data, list) and len(data) > 0:
+                data = data[0]
+
+            if isinstance(data, dict) and "address" in data:
+                addr = data["address"]
+                logger.info(f"📡 [MEXC] Deposit address for {coin} ({network}): {addr}")
+                return addr
+            
+            error_msg = data.get("msg") if isinstance(data, dict) else str(data)
+            logger.error(f"❌ MEXC get_deposit_address failed for {coin} on {network}: {error_msg} | Response: {data}")
+            return None
+        except Exception as e:
+            logger.error(f"❌ MEXC get_deposit_address exception: {e}")
+            return None
+
+    async def get_all_assets_info(self) -> Any:
+        """Fetch all coin/network configuration from MEXC."""
+        if not self._is_configured(): return None
+        await self._ensure_time_synced()
+        params = {"timestamp": self._now_ms(), "recvWindow": str(_RECV_WINDOW_MS)}
+        query_string = urllib.parse.urlencode(params)
+        params["signature"] = self._sign(query_string)
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{BASE_URL}/api/v3/capital/config/getall",
+                    headers={"X-MEXC-APIKEY": self.api_key},
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=20),
+                ) as resp:
+                    return await resp.json()
+        except Exception as e:
+            logger.error(f"MEXC get_all_assets_info extension: {e}")
             return None
 
     async def close(self) -> None:
