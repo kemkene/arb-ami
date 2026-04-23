@@ -51,6 +51,7 @@ class Opportunity:
     buy_price: float
     sell_price: float
     log_msg: str
+    trade_usdt: float = 0.0 # Added for profit threshold / buffer checks
 
 
 class ArbitrageEngine:
@@ -99,6 +100,16 @@ class ArbitrageEngine:
         self.hyperion_sqrt_price_x64: Optional[int] = None
         self.hyperion_liquidity: Optional[int] = None
         self.hyperion_last_update_ts: float = 0.0
+
+        # ── Profit Thresholds (Standardized) ──────────────────────────
+        self.min_profit = settings.min_profit_threshold
+        self.min_profit_dex_to_cex = settings.min_profit_dex_to_cex
+        self.min_profit_ami_cycle = settings.min_profit_ami_cycle
+        self.min_profit_apt_cycle = settings.min_profit_apt_cycle
+        self.min_profit_cross_cex = settings.min_profit_cross_cex
+        self.min_profit_cex_to_cex = settings.min_profit_cex_to_cex
+        self.min_profit_apt_start = settings.min_profit_apt_start
+        self.min_profit_ami_start = settings.min_profit_ami_start
 
         # DEX-DEX Settings
         self.enable_dex_dex_arb = settings.enable_dex_dex_arb
@@ -534,18 +545,32 @@ class ArbitrageEngine:
         is_shadow = False
         skip_reason = None
         
-        if best_opp.profit_usdt < self.min_profit:
-            is_shadow = True
-            skip_reason = f"Profit ${best_opp.profit_usdt:.4f} < Threshold ${self.min_profit}"
+        # ── Execution risk buffer ──
+        # Subtract safety margin before checking against threshold
+        buffer_usd = self._get_execution_risk_buffer(best_opp.trade_usdt)
+        profit_after_buffer = best_opp.profit_usdt - buffer_usd
+        min_required = self._get_min_profit_for_direction(best_opp.direction, best_opp.trade_usdt)
 
-        # Execute the winner
+        if profit_after_buffer < min_required:
+            is_shadow = True
+            skip_reason = (
+                f"Net Profit ${profit_after_buffer:.4f} (after -${buffer_usd:.4f} buffer) "
+                f"< Min Required ${min_required:.4f}"
+            )
+        else:
+            logger.info(
+                f"🛡️ Quality check OK: ${best_opp.profit_usdt:.4f} → ${profit_after_buffer:.4f} "
+                f"(-${buffer_usd:.4f} buffer, min=${min_required:.2f}) for {best_opp.direction}"
+            )
+
+        # Execute/Log the winner
         self._log_and_execute(
             best_opp.direction,
             best_opp.buy_price,
             best_opp.sell_price,
             best_opp.log_msg,
             best_opp.legs,
-            best_opp.profit_usdt,
+            profit_after_buffer, # Use profit after buffer for reporting
             is_shadow=is_shadow,
             skip_reason=skip_reason,
             log_steps=not is_shadow # Only log steps to JSONL if we are actually executing (not shadow)
@@ -586,7 +611,7 @@ class ArbitrageEngine:
                     TradeLeg("Bybit", self.cex_symbol, LegSide.BUY, bybit.ask, qty),
                     TradeLeg("MEXC", self.cex_symbol, LegSide.SELL, mexc.bid, qty),
                 ]
-                return Opportunity(direction, profit, legs, bybit.ask, mexc.bid, log_msg)
+                return Opportunity(direction, profit, legs, bybit.ask, mexc.bid, log_msg, trade_usdt=qty * bybit.ask)
 
         # Direction 2: Buy MEXC ask -> Sell Bybit bid
         max_qty_budget2 = settings.trade_amount_usdt / mexc.ask if mexc.ask > 0 else 0
@@ -606,7 +631,7 @@ class ArbitrageEngine:
                     TradeLeg("MEXC", self.cex_symbol, LegSide.BUY, mexc.ask, qty),
                     TradeLeg("Bybit", self.cex_symbol, LegSide.SELL, bybit.bid, qty),
                 ]
-                return Opportunity(direction, profit, legs, mexc.ask, bybit.bid, log_msg)
+                return Opportunity(direction, profit, legs, mexc.ask, bybit.bid, log_msg, trade_usdt=qty * mexc.ask)
         
         return None
 
@@ -720,7 +745,7 @@ class ArbitrageEngine:
                         tag=f"cex_buy_apt_{exchange_name}",
                     ),
                 ]
-                return Opportunity(direction, profit_usdt, legs, ami_quote.bid, apt_quote.ask, log_msg)
+                return Opportunity(direction, profit_usdt, legs, ami_quote.bid, apt_quote.ask, log_msg, trade_usdt=opt_size_usdt)
         
         return None
 
@@ -809,6 +834,7 @@ class ArbitrageEngine:
         # Optimization: Find optimal size only if baseline is promising
         opt_size_usdt = self._find_optimal_size(
             "CIRCULAR_AMI",
+            ex_id=exchange_name.lower(),
             ami_mid=ami_mid, r_apt=r_apt, r_ami=r_ami,
             ami_bid=ami_quote.bid, apt_ask=apt_quote.ask, cex_fee=cex_fee
         )
@@ -874,7 +900,7 @@ class ArbitrageEngine:
                     dex_direction="apt_to_ami",
                 ),
             ]
-            return Opportunity(direction, profit_usdt, legs, float(ami_quote.bid), float(ami_end / apt_out), log_msg)
+            return Opportunity(direction, profit_usdt, legs, float(ami_quote.bid), float(ami_end / apt_out), log_msg, trade_usdt=opt_size_usdt)
         
         return None
 
@@ -952,7 +978,7 @@ class ArbitrageEngine:
                                 TradeLeg(exchange=exchange_name.lower(), symbol=settings.apt_cex_symbol, side=LegSide.BUY, qty=apt_end, 
                                          price_est=apt_quote.ask, tag=f"cex_buy_apt_{exchange_name}"),
                             ]
-                            results.append(Opportunity(direction, profit_usdt, legs, float(ami_out / apt_start), float(ami_quote.bid), log_msg))
+                            results.append(Opportunity(direction, profit_usdt, legs, float(ami_out / apt_start), float(ami_quote.bid), log_msg, trade_usdt=opt_size_usdt))
 
         # ------------------------------------------------------------------ #
         # Direction B: Circular AMI (AMI -> APT (Hyperion) -> USDT (CEX) -> AMI (CEX))
@@ -1002,7 +1028,7 @@ class ArbitrageEngine:
                                 TradeLeg(exchange=exchange_name.lower(), symbol=settings.cex_symbol, side=LegSide.BUY, qty=ami_end, 
                                          price_est=ami_quote.ask, tag=f"cex_buy_ami_{exchange_name}"),
                             ]
-                            results.append(Opportunity(direction, profit_usdt_b, legs_b, float(apt_out / ami_start), float(apt_quote.bid), log_msg))
+                            results.append(Opportunity(direction, profit_usdt_b, legs_b, float(apt_out / ami_start), float(apt_quote.bid), log_msg, trade_usdt=opt_size_usdt_b))
 
         return results
 
@@ -1100,7 +1126,7 @@ class ArbitrageEngine:
                     dex_direction="ami_to_apt",
                 ),
             ]
-            results.append(Opportunity(direction, profit_usdt, legs, float(ami_mid_out / apt_start) if apt_start > 0 else 0, float(apt_end / ami_mid_out) if ami_mid_out > 0 else 0, log_msg))
+            results.append(Opportunity(direction, profit_usdt, legs, float(ami_mid_out / apt_start) if apt_start > 0 else 0, float(apt_end / ami_mid_out) if ami_mid_out > 0 else 0, log_msg, trade_usdt=opt_size_usdt))
 
         # ------------------------------------------------------------------ #
         # Direction 2: APT -> Hyperion -> AMI -> Cellana -> APT
@@ -1172,7 +1198,7 @@ class ArbitrageEngine:
                         dex_direction="ami_to_apt",
                     ),
                 ]
-                results.append(Opportunity(direction, profit_usdt2, legs, float(ami_hyp_out / apt_start2) if apt_start2 > 0 else 0, float(apt_end2 / ami_hyp_out) if ami_hyp_out > 0 else 0, log_msg))
+                results.append(Opportunity(direction, profit_usdt2, legs, float(ami_hyp_out / apt_start2) if apt_start2 > 0 else 0, float(apt_end2 / ami_hyp_out) if ami_hyp_out > 0 else 0, log_msg, trade_usdt=opt_size_usdt2))
         
         return results
 
@@ -1238,15 +1264,37 @@ class ArbitrageEngine:
                 opportunities = self._check_all_routes(bybit, mexc, bybit_apt, mexc_apt)
                 if opportunities:
                     best_opp = max(opportunities, key=lambda x: x.profit_usdt)
-                    if best_opp.profit_usdt > self.min_profit:
-                        self._log_and_execute(
-                            best_opp.direction,
-                            best_opp.buy_price,
-                            best_opp.sell_price,
-                            best_opp.log_msg,
-                            best_opp.legs,
-                            best_opp.profit_usdt
+                    
+                    # ── Tournament Winner Quality Check ──
+                    is_shadow = False
+                    skip_reason = None
+                    
+                    buffer_usd = self._get_execution_risk_buffer(best_opp.trade_usdt)
+                    profit_after_buffer = best_opp.profit_usdt - buffer_usd
+                    min_required = self._get_min_profit_for_direction(best_opp.direction, best_opp.trade_usdt)
+
+                    if profit_after_buffer < min_required:
+                        is_shadow = True
+                        skip_reason = (
+                            f"Net Profit ${profit_after_buffer:.4f} (after -${buffer_usd:.4f} buffer) "
+                            f"< Min Required ${min_required:.4f}"
                         )
+                    else:
+                        logger.info(
+                            f"🛡️ Winner Quality check OK: ${best_opp.profit_usdt:.4f} → ${profit_after_buffer:.4f} "
+                            f"(-${buffer_usd:.4f} buffer, min=${min_required:.2f}) for {best_opp.direction}"
+                        )
+
+                    self._log_and_execute(
+                        best_opp.direction,
+                        best_opp.buy_price,
+                        best_opp.sell_price,
+                        best_opp.log_msg,
+                        best_opp.legs,
+                        profit_after_buffer,
+                        is_shadow=is_shadow,
+                        skip_reason=skip_reason
+                    )
                 else:
                     # Optional: Log as trace or ignore if negative
                     pass
@@ -1323,6 +1371,55 @@ class ArbitrageEngine:
         optimal = (low + high) / 2
         return max(self.min_trade_usdt, optimal)
 
+    def _get_execution_risk_buffer(self, trade_usdt: float) -> float:
+        """Calculate USD safety buffer based on trade size."""
+        risk_buffer_pct = settings.execution_risk_buffer_pct
+        if risk_buffer_pct > 0 and trade_usdt > 0:
+            return trade_usdt * (risk_buffer_pct / 100.0)
+        return 0.0
+
+    def _get_min_profit_for_direction(self, direction: str, trade_usdt: float) -> float:
+        """Get direction-specific min profit (absolute USD).
+        
+        Takes the LARGER of (absolute min threshold) and (percentage of trade size).
+        """
+        direction_lower = direction.lower()
+        
+        # 1. Base threshold from settings
+        abs_min = self.min_profit
+        pct_min = 0.0
+        
+        if "dex_to_cex" in direction_lower:
+            abs_min = self.min_profit_dex_to_cex
+            pct_min = settings.min_profit_pct_dex_to_cex
+        elif "ami_cycle" in direction_lower or "circular_ami" in direction_lower:
+            abs_min = self.min_profit_ami_cycle
+            pct_min = settings.min_profit_pct_ami_cycle
+        elif "apt_cycle" in direction_lower or "circular_apt" in direction_lower:
+            abs_min = self.min_profit_apt_cycle
+            pct_min = settings.min_profit_pct_apt_cycle
+        elif "cross_cex" in direction_lower:
+            abs_min = self.min_profit_cross_cex
+            pct_min = 0.0
+        elif "cex_to_cex" in direction_lower:
+            abs_min = self.min_profit_cex_to_cex
+            pct_min = 0.0
+        elif "apt_start" in direction_lower:
+            abs_min = self.min_profit_apt_start
+            pct_min = settings.min_profit_pct_apt_start
+        elif "ami_start" in direction_lower:
+            abs_min = self.min_profit_ami_start
+            pct_min = settings.min_profit_pct_ami_start
+        elif "dex_dex" in direction_lower:
+            abs_min = self.min_profit_dex_dex
+            pct_min = 0.0
+            
+        # 2. Convert percentage to USD if applicable
+        usd_from_pct = (trade_usdt * pct_min / 100.0) if pct_min > 0 else 0.0
+        
+        # 3. Return the strictest limit
+        return max(abs_min, usd_from_pct)
+
     def _get_max_balance_for_route(self, route_type: str, **kwargs) -> float:
         """Helper to find the maximum USDT-equivalent we can trade based on current balances."""
         if not self.trade_executor or not self.trade_executor.balance_manager:
@@ -1336,27 +1433,27 @@ class ArbitrageEngine:
                 # Need APT on Dex
                 apt_bal = bm.get_free("dex", "APT")
                 apt_price = kwargs.get("apt_mid", 10.0)
-                # Reserve 0.1 APT for gas
-                return max(0.0, (apt_bal - 0.1) * apt_price)
+                # Use 5% safety buffer + reserve 0.1 APT for gas
+                return max(0.0, (apt_bal * 0.95 - 0.1) * apt_price)
             
             elif route_type == "DEX_DEX_HYPERION_CELLANA":
                 # Need APT on Dex
                 apt_bal = bm.get_free("dex", "APT")
                 apt_price = kwargs.get("apt_mid", 10.0)
-                return max(0.0, (apt_bal - 0.1) * apt_price)
+                return max(0.0, (apt_bal * 0.95 - 0.1) * apt_price)
                 
             elif route_type == "DEX_CEX_APT_CYCLE":
                 # Circular APT: DEX(APT->AMI) + CEX(AMI->USDT)
                 # 1. Check APT on DEX
                 apt_bal_dex = bm.get_free("dex", "APT")
                 apt_price = kwargs.get("apt_mid", 10.0)
-                size_from_dex = max(0.0, (apt_bal_dex - 0.1) * apt_price)
+                size_from_dex = max(0.0, (apt_bal_dex * 0.95 - 0.1) * apt_price)
                 
                 # 2. Check AMI on CEX (if ex_id provided)
                 if ex_id:
                     ami_bal_cex = bm.get_free(ex_id, "AMI")
                     ami_price = kwargs.get("ami_bid", 0.007)
-                    size_from_cex = ami_bal_cex * ami_price
+                    size_from_cex = (ami_bal_cex * 0.95) * ami_price
                     return min(size_from_dex, size_from_cex)
                 return size_from_dex
 
@@ -1364,11 +1461,11 @@ class ArbitrageEngine:
                 # Same as DEX_CEX_APT_CYCLE
                 apt_bal_dex = bm.get_free("dex", "APT")
                 apt_price = kwargs.get("apt_mid", 10.0)
-                size_from_dex = max(0.0, (apt_bal_dex - 0.1) * apt_price)
+                size_from_dex = max(0.0, (apt_bal_dex * 0.95 - 0.1) * apt_price)
                 if ex_id:
                     ami_bal_cex = bm.get_free(ex_id, "AMI")
                     ami_price = kwargs.get("ami_bid", 0.007)
-                    size_from_cex = ami_bal_cex * ami_price
+                    size_from_cex = (ami_bal_cex * 0.95) * ami_price
                     return min(size_from_dex, size_from_cex)
                 return size_from_dex
 
@@ -1377,27 +1474,59 @@ class ArbitrageEngine:
                 # 1. Check AMI on DEX
                 ami_bal_dex = bm.get_free("dex", "AMI")
                 ami_price = kwargs.get("ami_mid", 0.007)
-                size_from_dex = ami_bal_dex * ami_price
+                size_from_dex = (ami_bal_dex * 0.95) * ami_price
                 # 2. Check APT on CEX
                 if ex_id:
                     apt_bal_cex = bm.get_free(ex_id, "APT")
                     apt_price = kwargs.get("apt_bid", 10.0)
-                    size_from_cex = max(0.0, (apt_bal_cex - 1.0) * apt_price) # Reserve 1 APT for gas
+                    size_from_cex = max(0.0, (apt_bal_cex * 0.95 - 0.5) * apt_price) # Reserve 0.5 APT for gas
                     return min(size_from_dex, size_from_cex)
                 return size_from_dex
+
+            elif route_type == "CIRCULAR_AMI":
+                # Circular AMI: CEX(AMI->USDT) -> CEX(USDT->APT) -> DEX(APT->AMI)
+                # 1. CEX AMI
+                ami_price = kwargs.get("ami_mid", 0.007)
+                size_from_cex = settings.trade_amount_usdt
+                if ex_id:
+                    ami_bal = bm.get_free(ex_id, "AMI")
+                    size_from_cex = (ami_bal * 0.95) * ami_price
+                
+                # 2. DEX APT
+                apt_bal_dex = bm.get_free("dex", "APT")
+                apt_price = kwargs.get("apt_mid", 10.0)
+                size_from_dex = max(0.0, (apt_bal_dex * 0.95 - 0.1)) * apt_price
+                
+                return min(size_from_cex, size_from_dex)
+
+            elif route_type == "CIRCULAR_APT":
+                # Circular APT: CEX(APT->USDT) -> CEX(USDT->AMI) -> DEX(AMI->APT)
+                # 1. CEX APT
+                apt_price = kwargs.get("apt_mid", 10.0)
+                size_from_cex = settings.trade_amount_usdt
+                if ex_id:
+                    apt_bal = bm.get_free(ex_id, "APT")
+                    size_from_cex = max(0.0, (apt_bal * 0.95 - 0.5) * apt_price)
+                
+                # 2. DEX AMI
+                ami_bal_dex = bm.get_free("dex", "AMI")
+                ami_price = kwargs.get("ami_mid", 0.007)
+                size_from_dex = (ami_bal_dex * 0.95) * ami_price
+                
+                return min(size_from_cex, size_from_dex)
 
             elif route_type == "CROSS_CEX_CIRCULAR_APT":
                 # Need APT on Source CEX
                 if ex_id:
                     apt_bal = bm.get_free(ex_id, "APT")
                     apt_price = kwargs.get("apt_mid", 10.0)
-                    return max(0.0, (apt_bal - 0.5) * apt_price)
+                    return max(0.0, (apt_bal * 0.95 - 0.5) * apt_price)
                 return settings.trade_amount_usdt
 
             elif route_type == "CEX_CEX":
                 # Need USDT on Buy Exchange
                 if ex_id:
-                    return bm.get_free(ex_id, "USDT")
+                    return bm.get_free(ex_id, "USDT") * 0.95
                 return settings.trade_amount_usdt
 
         except Exception as e:

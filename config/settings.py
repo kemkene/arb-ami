@@ -104,6 +104,9 @@ class Settings:
     min_profit_cross_cex: float = field(
         default_factory=lambda: float(os.getenv("MIN_PROFIT_CROSS_CEX", "0.05"))
     )
+    min_profit_apt_cycle: float = field(
+        default_factory=lambda: float(os.getenv("MIN_PROFIT_APT_CYCLE", "0.05"))
+    )
     min_profit_cex_to_cex: float = field(
         default_factory=lambda: float(os.getenv("MIN_PROFIT_CEX_TO_CEX", "0.02"))
     )
@@ -117,6 +120,9 @@ class Settings:
     )
     min_profit_pct_cross_cex: float = field(
         default_factory=lambda: float(os.getenv("MIN_PROFIT_PCT_CROSS_CEX", "0.05"))
+    )
+    min_profit_pct_apt_cycle: float = field(
+        default_factory=lambda: float(os.getenv("MIN_PROFIT_PCT_APT_CYCLE", "0.05"))
     )
     min_profit_pct_cex_to_cex: float = field(
         default_factory=lambda: float(os.getenv("MIN_PROFIT_PCT_CEX_TO_CEX", "0.02"))
@@ -144,6 +150,12 @@ class Settings:
     )
     min_profit_pct_ami_start: float = field(
         default_factory=lambda: float(os.getenv("MIN_PROFIT_PCT_AMI_START", "0.05"))
+    )
+
+    # ── CEX-to-CEX Rebalance Settings ──────────────────────────────
+    # Only move surplus if Balance(Exchange A) > Threshold * Factor
+    cex_rebalance_threshold_factor: float = field(
+        default_factory=lambda: float(os.getenv("CEX_REBALANCE_THRESHOLD_FACTOR", "2.0"))
     )
 
     # DEX-DEX cycle thresholds

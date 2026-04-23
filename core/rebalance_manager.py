@@ -28,6 +28,7 @@ class RebalanceManager:
         self.aptos_trader = AptosTrader()
         self._is_running = False
         self._last_check_ts = 0.0
+        self._last_sync_ts = 0.0
         self.interval_sec = settings.rebalance_interval_min * 60
 
         # Define 'Max' thresholds for DEX (move to settings if needed)
@@ -46,11 +47,19 @@ class RebalanceManager:
         
         while self._is_running:
             try:
+                # 1. Main Rebalance Check (usually every 30m)
                 await self.check_and_rebalance()
+                
+                # 2. Proactive Bybit Funding Sync (every 5m)
+                # This handles incoming deposits from other exchanges/DEX
+                if (now := time.time()) - self._last_sync_ts > 300: # 5 minutes
+                    await self._sync_bybit_funding_to_trading()
+                    self._last_sync_ts = now
+                    
             except Exception as e:
                 logger.error(f"❌ RebalanceManager error: {e}")
             
-            await asyncio.sleep(60) # Check every minute if it's time to run
+            await asyncio.sleep(60) # Check status every minute
 
     async def stop(self):
         self._is_running = False
@@ -84,7 +93,10 @@ class RebalanceManager:
         # 3. Handle DEX Overflow (Excess to CEX)
         await self._check_dex_excess()
 
-        # 4. Check USDT on CEX (Bybit + MEXC total)
+        # 4. Handle CEX-to-CEX Imbalance (Direct balancing between Bybit <=> MEXC)
+        await self._check_cex_to_cex_imbalance()
+
+        # 5. Check USDT on CEX (Bybit + MEXC total)
         usdt_bybit = self.balance_manager.get_free("bybit", "USDT")
         usdt_mexc = self.balance_manager.get_free("mexc", "USDT")
         total_usdt = usdt_bybit + usdt_mexc
@@ -174,6 +186,70 @@ class RebalanceManager:
                 await self._deposit_to_specific_cex("mexc", "AMI", needed)
             else:
                 logger.warning(f"⚖️ [REBALANCE] MEXC AMI is LOW ({ami_mexc:.0f}) but DEX buffer is insufficient ({ami_dex:.0f} <= {ami_buffer}). Skipping.")
+
+    async def _check_cex_to_cex_imbalance(self):
+        """Balance assets directly between CEXs if one has a massive surplus."""
+        assets = [
+            ("AMI", settings.min_ami_threshold),
+            ("APT", settings.min_apt_threshold),
+            ("USDT", settings.min_usdt_threshold)
+        ]
+        
+        for coin, threshold in assets:
+            bal_bybit = self.balance_manager.get_free("bybit", coin)
+            bal_mexc = self.balance_manager.get_free("mexc", coin)
+            
+            # Case 1: Bybit surplus, MEXC shortage
+            if bal_bybit > (threshold * settings.cex_rebalance_threshold_factor) and bal_mexc < threshold:
+                amount = threshold - bal_mexc + (threshold * 0.2) # Fill to threshold + 20% safety
+                logger.warning(f"⚖️ [REBALANCE] CEX IMBALANCE: Bybit {coin} is SURPLUS ({bal_bybit:.2f}), MEXC is LOW ({bal_mexc:.2f}).")
+                logger.info(f"🔄 Moving {amount:.2f} {coin} from Bybit -> MEXC")
+                await self._transfer_between_cex("bybit", "mexc", coin, amount)
+                
+            # Case 2: MEXC surplus, Bybit shortage
+            elif bal_mexc > (threshold * settings.cex_rebalance_threshold_factor) and bal_bybit < threshold:
+                amount = threshold - bal_bybit + (threshold * 0.2)
+                logger.warning(f"⚖️ [REBALANCE] CEX IMBALANCE: MEXC {coin} is SURPLUS ({bal_mexc:.2f}), Bybit is LOW ({bal_bybit:.2f}).")
+                logger.info(f"🔄 Moving {amount:.2f} {coin} from MEXC -> Bybit")
+                await self._transfer_between_cex("mexc", "bybit", coin, amount)
+
+    async def _transfer_between_cex(self, from_ex: str, to_ex: str, coin: str, amount: float):
+        """Execute on-chain withdrawal from one CEX to another's deposit address."""
+        # Minimum withdrawal checks
+        if coin.upper() == "USDT" and from_ex == "mexc" and amount < 10.0:
+            logger.warning(f"⚖️ [REBALANCE] USDT amount {amount:.2f} is below MEXC minimum (10.0). Adjusting to 10.1")
+            amount = 10.1
+            
+        # 1. Get target deposit address
+        target_addr = None
+        if to_ex == "bybit":
+            target_addr = await self.bybit_trader.get_deposit_address(coin, settings.bybit_withdraw_chain)
+        elif to_ex == "mexc":
+            target_addr = await self.mexc_trader.get_deposit_address(coin, settings.mexc_withdraw_network)
+            
+        if not target_addr:
+            logger.error(f"❌ [REBALANCE] Failed to get deposit address for {coin} on {to_ex}")
+            return
+
+        # 2. Execute withdrawal
+        logger.info(f"🔄 [REBALANCE] Withdrawing {amount:.2f} {coin} from {from_ex} to {to_ex} (Addr: {target_addr})")
+        try:
+            if from_ex == "bybit":
+                await self.bybit_trader.withdraw(
+                    coin=coin,
+                    amount=amount,
+                    address=target_addr,
+                    chain=settings.bybit_withdraw_chain
+                )
+            elif from_ex == "mexc":
+                await self.mexc_trader.withdraw(
+                    coin=coin,
+                    amount=amount,
+                    address=target_addr,
+                    network=settings.mexc_withdraw_network
+                )
+        except Exception as e:
+            logger.error(f"❌ [REBALANCE] Direct CEX transfer failed: {e}")
 
     async def _check_dex_excess(self):
         """Move extreme excess DEX funds back to CEX (Security Overflow)."""

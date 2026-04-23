@@ -487,12 +487,17 @@ class BybitTrader:
             
         await self._ensure_time_synced()
         
+        # Round amount to avoid floating point noise issues (retCode: 131210)
+        # USDT typically 6 decimals, others 4 is usually safe for internal transfers
+        prec = 6 if coin.upper() == "USDT" else 4
+        rounded_amount = float(format(amount, f".{prec}f"))
+        
         try:
             transfer_id = str(uuid.uuid4())
             body_dict = {
                 "transferId": transfer_id,
-                "coin": coin,
-                "amount": str(amount),
+                "coin": coin.upper(),
+                "amount": str(rounded_amount),
                 "fromAccountType": from_account,
                 "toAccountType": to_account,
                 "timestamp": int(self._now_ms(sensitive=True)),
@@ -512,7 +517,7 @@ class BybitTrader:
                 "Content-Type": "application/json",
             }
             
-            logger.info(f"🔄 Bybit internal transfer: {amount} {coin} {from_account} -> {to_account}")
+            logger.info(f"🔄 Bybit internal transfer: {rounded_amount} {coin.upper()} {from_account} -> {to_account}")
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     f"{BASE_URL}/v5/asset/transfer/inter-transfer",
@@ -538,17 +543,31 @@ class BybitTrader:
 
         await self._ensure_time_synced()
         
-        async def _perform_withdraw(ts_ms: str):
+        # Round amount for withdrawal accuracy (Bybit V5 asset requirements)
+        # USDT 6 decimals, others 4 safe decimals
+        prec = 6 if coin.upper() == "USDT" else 4
+        rounded_amount = float(format(amount, f".{prec}f"))
+        
+        async def _perform_withdraw(ts_ms: str) -> tuple[Optional[dict], Optional[str], int]:
             # Automatic chain mapping for common errors
-            chain_map = {"APT": "APTOS", "USDT": "ERC20"}
-            final_chain = chain_map.get(chain.upper(), chain.upper())
+            # Bybit often uses 'APT' as the chain name for Aptos tokens (AMI, etc.)
+            chain_map = {
+                "APT": "APTOS", 
+                "AMI": "APT", 
+                "USDT": "ERC20"
+            }
+            final_chain = chain_map.get(coin.upper(), chain.upper())
+            
+            # Special case for Aptos network naming variations
+            if final_chain == "APTOS" and coin.upper() != "APT":
+                final_chain = "APT" # Try 'APT' for tokens if 'APTOS' fails
             
             # MINIMALIST BODY: Remove 'tag' entirely if empty
             body_dict = {
                 "coin": coin.upper(),
                 "chain": final_chain,
                 "address": address,
-                "amount": str(amount),
+                "amount": str(rounded_amount),
                 "forceChain": 1, # Force on-chain for external wallets
                 "accountType": "FUND",
                 "feeType": 1,    # Auto-deduct fee from amount
@@ -587,6 +606,8 @@ class BybitTrader:
                     if resp.status != 200:
                         return None, await resp.text(), resp.status
                     return await resp.json(), None, 200
+            
+            return None, "Unexpected flow", 500
 
         # Perform withdrawal sequence
         try:
@@ -618,7 +639,7 @@ class BybitTrader:
                 if fund_bal < amount:
                     logger.info(f"⚠️ [Bybit] Insufficient FUND balance ({fund_bal} < {amount}). Checking UNIFIED...")
                     # Try to transfer enough from UNIFIED to FUND
-                    success = await self.internal_transfer(coin, amount, "UNIFIED", "FUND")
+                    success = await self.internal_transfer(coin.upper(), amount, "UNIFIED", "FUND")
                     if success:
                         logger.info("⏳ Waiting 3s for transfer to settle...")
                         await asyncio.sleep(3)

@@ -17,7 +17,7 @@ bybit_wallets.csv
 aptos_wallets.csv
 
 # Logs
-logs/*.log
+*.log
 logs/*.jsonl
 
 # IDE
